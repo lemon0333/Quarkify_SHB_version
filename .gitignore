@@ -1,3 +1,8 @@
+# Default
+.DS_Store
+docs/.DS_Store
+
+
 # Dependency directories
 node_modules/
 
@@ -7,3 +12,9 @@ scratch/
 # Quarkify build outputs
 *_output
 *_ouput
+
+# External benchmark test repositories
+h2database/
+hoppscotch/
+lombok/
+requests/

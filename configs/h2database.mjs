@@ -1,6 +1,6 @@
 // configs/h2database.mjs — H2 Database Java parser configuration
-// 사용: node quarkify.mjs configs/h2database.mjs
-// 출력: /path/to/your/workspace/quarkify/h2database_output
+// 사용 (Usage): node quarkify.mjs configs/h2database.mjs
+// 출력 (Output): /path/to/your/workspace/quarkify/h2database_output
 
 export default {
   name: 'h2database-java-analysis',

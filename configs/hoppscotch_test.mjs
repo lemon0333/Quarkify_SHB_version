@@ -3,7 +3,7 @@ export default {
   srcDir: '/path/to/your/workspace/quarkify/hoppscotch',
   outDir: '/path/to/your/workspace/quarkify/hoppscotch_output',
 
-  // 핵심 TypeScript 공통 소스 디렉터리 일괄 매핑
+  // 핵심 TypeScript 공통 소스 디렉터리 일괄 매핑 (Batch mapping of core TypeScript common source directories)
   sourceFiles: [
     'packages/hoppscotch-common/src/**/*.ts',
   ],

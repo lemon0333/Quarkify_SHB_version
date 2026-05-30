@@ -1,6 +1,6 @@
 // configs/llama_cpp_cuda.mjs — llama.cpp CUDA backend
-// 사용: node quarkify_v7.mjs configs/llama_cpp_cuda.mjs
-// 출력: ~/antigravity/quark/llama_cpp/cuda/llama3-3b-q4km/
+// 사용 (Usage): node quarkify_v7.mjs configs/llama_cpp_cuda.mjs
+// 출력 (Output): ~/antigravity/quark/llama_cpp/cuda/llama3-3b-q4km/
 
 export default {
   name: 'llama.cpp CUDA backend (v7)',
@@ -45,7 +45,7 @@ export default {
     'ggml/src/ggml-cuda/argmax.cuh',
   ],
 
-  perfData: {},  // llama.cpp 측 NCU 데이터는 추후 측정 시 채움
+  perfData: {},  // llama.cpp 측 NCU 데이터는 추후 측정 시 채움 (llama.cpp NCU data will be filled in during later measurements)
 
   guessRole(name) {
     const n = name.toLowerCase();
