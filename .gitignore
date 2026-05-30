@@ -1,0 +1,9 @@
+# Dependency directories
+node_modules/
+
+# Local development logs and tools
+scratch/
+
+# Quarkify build outputs
+*_output
+*_ouput
