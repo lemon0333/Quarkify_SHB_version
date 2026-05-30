@@ -40,7 +40,12 @@ import { execSync } from 'child_process';
 // ─── CLI / 컨피그 로드 ───
 const configPath = process.argv[2];
 if (!configPath) {
-  console.error('Usage: node quarkify_v7.mjs <path/to/config.mjs>');
+  console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
+  console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
+  process.exit(1);
+}
+if (!fs.existsSync(configPath)) {
+  console.error(`❌ 에러: 지정한 설정 파일을 찾을 수 없습니다: "${configPath}"`);
   process.exit(1);
 }
 const cfgAbs = path.resolve(configPath);
@@ -1982,6 +1987,12 @@ async function main() {
   console.log(`🔬 quarkify v1.0.0 — ${CONFIG.name} 시작...`);
   console.log(`📂 srcDir:  ${CONFIG.srcDir}`);
   console.log(`📁 outDir:  ${CONFIG.outDir}\n`);
+
+  if (!fs.existsSync(CONFIG.srcDir)) {
+    console.error(`❌ 에러: 설정된 소스 디렉터리(srcDir)가 존재하지 않습니다: "${CONFIG.srcDir}"`);
+    console.error('설정 파일(*.mjs)의 srcDir 경로를 본인의 실제 로컬 경로로 수정해 주세요.');
+    process.exit(1);
+  }
 
   // Glob 파일 스캔 및 매핑
   let resolvedFiles = [];
