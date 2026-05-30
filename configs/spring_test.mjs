@@ -3,7 +3,7 @@ export default {
   srcDir: '/path/to/your/workspace/quarkify',
   outDir: '/path/to/your/workspace/quarkify/spring_test_output',
 
-  // Glob 자동 매핑을 테스트하기 위한 와일드카드 설정
+  // Glob 자동 매핑을 테스트하기 위한 와일드카드 설정 (Wildcard settings for testing auto-glob mapping)
   sourceFiles: [
     'scratch/*.java',
   ],

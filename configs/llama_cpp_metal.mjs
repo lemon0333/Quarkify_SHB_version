@@ -1,6 +1,6 @@
 // configs/llama_cpp_metal.mjs — llama.cpp Metal backend configuration (v7)
-// 사용: node quarkify_v7.mjs configs/llama_cpp_metal.mjs
-// 출력: ~/antigravity/quark/llama_cpp/metal/llama3-3b-q4km/
+// 사용 (Usage): node quarkify_v7.mjs configs/llama_cpp_metal.mjs
+// 출력 (Output): ~/antigravity/quark/llama_cpp/metal/llama3-3b-q4km/
 
 export default {
   name: 'llama-cpp-metal-llama3-3b-q4km (v7)',
@@ -24,7 +24,7 @@ export default {
   ],
 
   perfData: {
-    // llama.cpp Metal 벤치마크 데이터를 수집하면 여기에 누적합니다.
+    // llama.cpp Metal 벤치마크 데이터를 수집하면 여기에 누적합니다. (Accumulate llama.cpp Metal benchmark data here once collected.)
   },
 
   guessRole(name) {

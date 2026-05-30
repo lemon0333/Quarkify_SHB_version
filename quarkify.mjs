@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 /**
- * 쿼크화(Quarkify) v1.0.0 — Generic config-driven engine
+ * 쿼크화(Quarkify) v1.0.0 — Generic config-driven engine (Quarkify v1.0.0 — Generic config-driven engine)
  *
  * Copyright 2026 teamjupiter
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  *
  * v3.1 의 모든 분해 로직을 보존하면서, 프로젝트별 정보(SRC_DIR / OUTPUT_DIR /
- * SOURCE_FILES / PERF_DATA / role classifier)를 외부 config 파일로 분리.
+ * SOURCE_FILES / PERF_DATA / role classifier)를 외부 config 파일로 분리. (Preserving all decomposition logic from v3.1, while separating project-specific information (SRC_DIR / OUTPUT_DIR / SOURCE_FILES / PERF_DATA / role classifier) into external config files.)
  *
- * 사용법:
+ * 사용법 (Usage):
  *   node quarkify_v7.mjs configs/sovereign_cuda.mjs
  *   node quarkify_v7.mjs configs/sovereign_metal.mjs
  *   node quarkify_v7.mjs configs/llama_cpp_cuda.mjs
  *
- * Config 인터페이스 (configs/*.mjs):
+ * Config 인터페이스 (Config Interface) (configs/*.mjs):
  *   export default {
  *     name:         'sovereign-cuda-llama3',
  *     srcDir:       '/abs/path/to/source/root',
@@ -24,12 +24,12 @@
  *     guessRole:    (name: string) => string,   // project-specific role map
  *   };
  *
- * v3.1 대비 v4 변경점:
- *   1. SRC_DIR / OUTPUT_DIR / SOURCE_FILES / PERF_DATA / guessRole 모두 config 로 이동
- *   2. Metal `.metal` (MSL) 파서 강화 — kernel void / device / threadgroup /
- *      constant storage qualifier 인식, [[buffer(N)]] attribute 추출,
- *      함수 본문 재귀 파싱 (Zig fn parser 와 동일 트릭)
- *   3. Objective-C `.m` / `.mm` 기본 파싱 (interface / implementation / @-decl)
+ * v3.1 대비 v4 변경점 (Changes in v4 compared to v3.1):
+ *   1. SRC_DIR / OUTPUT_DIR / SOURCE_FILES / PERF_DATA / guessRole 모두 config 로 이동 (All moved to config)
+ *   2. Metal `.metal` (MSL) 파서 강화 (Enhanced Metal .metal (MSL) parser) — kernel void / device / threadgroup /
+ *      constant storage qualifier 인식 (recognizing qualifiers), [[buffer(N)]] attribute 추출 (extracting attributes),
+ *      함수 본문 재귀 파싱 (recursive parsing of function body) (Zig fn parser 와 동일 트릭 - same trick as Zig fn parser)
+ *   3. Objective-C `.m` / `.mm` 기본 파싱 (Basic parsing of Objective-C .m / .mm) (interface / implementation / @-decl)
  */
 
 import fs from 'fs';
@@ -37,7 +37,7 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import { execSync } from 'child_process';
 
-// ─── CLI / 컨피그 로드 ───
+// ─── CLI / 컨피그 로드 (Load CLI / Config) ───
 const configPath = process.argv[2];
 if (!configPath) {
   console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
@@ -67,7 +67,7 @@ try {
   process.exit(1);
 }
 
-// 필수 속성 검증
+// 필수 속성 검증 (Required Property Validation)
 const requiredFields = ['srcDir', 'outDir', 'sourceFiles'];
 for (const field of requiredFields) {
   if (CONFIG[field] === undefined || CONFIG[field] === null) {
@@ -76,7 +76,7 @@ for (const field of requiredFields) {
   }
 }
 
-// ─── 유틸 ───
+// ─── 유틸 (Utils) ───
 function safeName(name) {
   if (!name) return '_anonymous_';
   return name.replace(/[^a-zA-Z0-9_$.]/g, '_').substring(0, 100);
@@ -96,7 +96,7 @@ function perfBand(pct) {
 
 const guessRole = CONFIG.guessRole || ((_) => 'general');
 
-// ─── PTX arg 의미 분류 ───
+// ─── PTX arg 의미 분류 (PTX Argument Classification) ───
 function classifyPtxArg(raw, opcode) {
   let r = raw.trim();
   if (!r) return { kind: 'empty', value: '', type: '' };
@@ -112,7 +112,7 @@ function classifyPtxArg(raw, opcode) {
   return { kind: 'other', value: r, type: '' };
 }
 
-// ─── Zig struct 필드 파서 ───
+// ─── Zig struct 필드 파서 (Zig Struct Field Parser) ───
 function parseZigStructFields(body) {
   const fields = [];
   const lines = body.split('\n');
@@ -127,7 +127,7 @@ function parseZigStructFields(body) {
   return fields;
 }
 
-// ─── Java class/interface 필드 파서 ───
+// ─── Java class/interface 필드 파서 (Java Class/Interface Field Parser) ───
 function parseJavaFields(body) {
   const fields = [];
   const lines = body.split('\n');
@@ -141,14 +141,14 @@ function parseJavaFields(body) {
   return fields;
 }
 
-// ─── JS/TS class/interface 필드 파서 ───
+// ─── JS/TS class/interface 필드 파서 (JS/TS Class/Interface Field Parser) ───
 function parseJSFields(body) {
   const fields = [];
   const lines = body.split('\n');
   for (const raw of lines) {
     let l = raw.replace(/\/\/.*/g, '').trim();
     if (!l || l.includes('(') || l.includes(')') || l.startsWith('class ') || l.startsWith('interface ') || l.startsWith('export class ') || l.startsWith('export interface ')) continue;
-    // JS/TS 프로퍼티 정규식
+    // JS/TS 프로퍼티 정규식 (JS/TS Property Regex)
     const m = l.match(/^\s*(?:(?:public|private|protected|readonly|static)\s+)*([a-zA-Z0-9_]+)(\?)?(?:\s*:\s*([^=;]+))?(?:\s*=\s*([^;]+))?;\s*$/);
     if (!m) continue;
     fields.push({
@@ -160,7 +160,7 @@ function parseJSFields(body) {
   return fields;
 }
 
-// ─── Zig 식 분해 ───
+// ─── Zig 식 분해 (Decompose Zig Expression) ───
 function decomposeZigExpr(expr) {
   const e = expr.trim();
   if (!e) return null;
@@ -188,9 +188,9 @@ function decomposeZigExpr(expr) {
   return null;
 }
 
-// ─── 재귀 stmt 파서 (Zig + MSL/C++ 공용) ───
-// MSL 은 C++ 서브셋. Zig 와 syntax 가 다르지만 (e.g. `}` 의미, 캡처 `|x|` 미사용)
-// 핵심 구조 — if/while/for/return/generic stmt — 는 거의 동일하므로 재사용.
+// ─── 재귀 stmt 파서 (Recursive Statement Parser) (Zig + MSL/C++ 공용 - Shared Zig + MSL/C++) ───
+// MSL 은 C++ 서브셋. Zig 와 syntax 가 다르지만 (e.g. `}` 의미, 캡처 `|x|` 미사용) (MSL is a C++ subset. Although the syntax differs from Zig (e.g., meaning of `}`, capture `|x|` is not used))
+// 핵심 구조 — if/while/for/return/generic stmt — 는 거의 동일하므로 재사용. (The core structure — if/while/for/return/generic stmt — is almost identical, so it is reused.)
 class CStyleStmtParser {
   constructor(text, dialect = 'zig') {
     this.t = text;
@@ -515,7 +515,7 @@ class CStyleStmtParser {
   }
 }
 
-// ─── stmt AST → 폴더 트리 ───
+// ─── stmt AST → 폴더 트리 (stmt AST to Folder Tree) ───
 function emitStmtNode(stmt, parentPath, idx) {
   const prefix = `stmt_${idx}`;
   let stmtName;
@@ -622,7 +622,7 @@ function emitStmtList(stmts, parentPath) {
   for (let i = 0; i < stmts.length; i++) emitStmtNode(stmts[i], parentPath, i);
 }
 
-// ─── Python 인덴테이션 기반 구문 분석기 ───
+// ─── Python 인덴테이션 기반 구문 분석기 (Python Indentation-based Parser) ───
 class PythonIndentParser {
   constructor(lines) {
     this.lines = lines;
@@ -738,7 +738,7 @@ class PythonIndentParser {
   }
 }
 
-// ─── Python 노드 → 폴더 트리 실체화 ───
+// ─── Python 노드 → 폴더 트리 실체화 (Python Node to Folder Tree Realization) ───
 function emitPythonNode(node, parentPath, idx) {
   const prefix = `stmt_${idx}`;
   let stmtName = `${prefix}__expr`;
@@ -823,7 +823,7 @@ function annotateGeneric(text, dir) {
   else if (stmt.includes('<=')) children.push('binop__leq');
   else if (stmt.includes('>=')) children.push('binop__geq');
   else if (stmt.includes('=')) children.push('assign');
-  // CUDA / Metal 표식
+  // CUDA / Metal 표식 (CUDA / Metal markers)
   if (stmt.includes('__syncthreads')) children.push('cuda__syncthreads');
   if (stmt.includes('__shfl')) children.push('cuda__shfl');
   if (stmt.includes('__shared__')) children.push('cuda__shared_decl');
@@ -850,7 +850,7 @@ function annotateGeneric(text, dir) {
   }
 }
 
-// ─── 엔진 ───
+// ─── 엔진 (Engine) ───
 class QuarkFolderEngine {
   constructor(outputDir) {
     this.outputDir = outputDir;
@@ -1173,11 +1173,11 @@ class QuarkFolderEngine {
   }
 
   // ─── Metal `.metal` (MSL: Metal Shading Language) ───
-  // MSL = C++ subset. 핵심 디코드:
-  //   - `kernel void NAME(args) { ... }`    → kernel (PTX entry 와 동등)
+  // MSL = C++ subset. 핵심 디코드 (Core decodes):
+  //   - `kernel void NAME(args) { ... }`    → kernel (PTX entry 와 동등 - equivalent to PTX entry)
   //   - `void NAME(args) { ... }`            → device_fn
   //   - `struct NAME { ... };`               → struct
-  //   - param 안의 `[[buffer(N)]]`, `[[thread_position_in_grid]]` 등 attribute 캡처
+  //   - param 안의 `[[buffer(N)]]`, `[[thread_position_in_grid]]` 등 attribute 캡처 (capturing attributes inside params)
   //   - storage qualifier: device / constant / threadgroup / thread
   processMetal(text, fileQuarkPath, relPath) {
     const lines = text.split('\n');
@@ -1186,7 +1186,7 @@ class QuarkFolderEngine {
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
-      // kernel signature: 한 줄 또는 여러 줄에 걸침
+      // kernel signature: 한 줄 또는 여러 줄에 걸침 (spans one or multiple lines)
       const km = line.match(/^\s*kernel\s+void\s+([a-zA-Z0-9_]+)\s*\(/);
       const fm = !km && line.match(/^\s*(?:static\s+|inline\s+)*(?:[a-zA-Z_][a-zA-Z0-9_]*(?:\s*<[^>]*>)?\s+[*&]*\s*|void\s+)([a-zA-Z0-9_]+)\s*\(/);
       const sm = !km && !fm && line.match(/^\s*struct\s+([a-zA-Z0-9_]+)\s*\{/);
@@ -1197,17 +1197,17 @@ class QuarkFolderEngine {
       if (km) {
         entryName = km[1]; kind = 'metal_kernel'; role = guessRole(entryName);
       } else if (fm) {
-        // generic free function — 헷갈리니까 device_fn 으로 라벨
-        // (host_fn 이 아니므로 — Metal MSL 은 host 코드 못 작성)
+        // generic free function — 헷갈리니까 device_fn 으로 라벨 (labeled as device_fn to avoid confusion)
+        // (host_fn 이 아니므로 — Metal MSL 은 host 코드 못 작성) (since it is not host_fn — Metal MSL cannot write host code)
         entryName = fm[1]; kind = 'device_fn'; role = guessRole(entryName);
       } else {
         entryName = sm[1]; kind = 'struct'; role = 'type';
       }
 
-      // 시그니처/구조 끝까지 수집해서 본문 brace 찾기.
-      // 주의: Metal kernel 시그니처에는 `[[buffer(0)]]` 같은 attribute 가 포함되어
-      // 그 안의 `()` 가 단순한 `.includes(')')` 매칭을 깨뜨림. 따라서 paren
-      // depth 를 추적하면서 unmatched `)` 가 닫힐 때까지 모은다.
+      // 시그니처/구조 끝까지 수집해서 본문 brace 찾기. (Collect signature/structure to the end to find body brace.)
+      // 주의: Metal kernel 시그니처에는 `[[buffer(0)]]` 같은 attribute 가 포함되어 (Note: Metal kernel signature contains attributes like `[[buffer(0)]]`)
+      // 그 안의 `()` 가 단순한 `.includes(')')` 매칭을 깨뜨림. 따라서 paren (which breaks simple `.includes(')')` matching inside. Thus,)
+      // depth 를 추적하면서 unmatched `)` 가 닫힐 때까지 모은다. (tracking paren depth to collect until unmatched `)` is closed.)
       let sigLines = [line];
       let j = i + 1;
       if (kind === 'struct') {
@@ -1229,8 +1229,8 @@ class QuarkFolderEngine {
         }
       }
 
-      // body brace scan — 라인 i 부터 첫 `{` 찾고 그 다음 줄을 bodyStart 로.
-      // 매칭 `}` 찾으면 bodyEnd. 단순하고 sigText 의존성 없음.
+      // body brace scan — 라인 i 부터 첫 `{` 찾고 그 다음 줄을 bodyStart 로. (scan body brace — find first `{` from line i and set next line as bodyStart.)
+      // 매칭 `}` 찾으면 bodyEnd. 단순하고 sigText 의존성 없음. (bodyEnd when matching `}` is found. Simple and has no dependency on sigText.)
       const sigText = sigLines.join('\n');
       let bodyStart = -1, bodyEnd = -1;
       let foundOpen = false;
@@ -1244,8 +1244,8 @@ class QuarkFolderEngine {
             bDepth++;
             if (!foundOpen) {
               foundOpen = true;
-              // body content 는 `{` 다음 라인부터. (one-liner struct 의 인라인 body
-              // 는 놓치지만 field parser 가 ; split 으로 견딘다.)
+              // body content 는 `{` 다음 라인부터. (one-liner struct 의 인라인 body (body content starts from next line after `{`. (inlined body of one-liner struct)
+              // 는 놓치지만 field parser 가 ; split 으로 견딘다.) (is missed, but field parser handles it via ; split))
               bodyStart = k + 1;
             }
           } else if (ch === '}') {
@@ -1263,7 +1263,7 @@ class QuarkFolderEngine {
       mkdirSync(symQuarkPath);
 
       if (kind !== 'struct') {
-        // params 파싱: () 안의 콤마 분리
+        // params 파싱: () 안의 콤마 분리 (Parsing params: split by comma inside ())
         const sigOnly = sigText.split('{')[0];
         const parenStart = sigOnly.indexOf('(');
         const parenEnd = sigOnly.lastIndexOf(')');
@@ -1273,8 +1273,8 @@ class QuarkFolderEngine {
           for (let pi = 0; pi < params.length; pi++) {
             const p = params[pi].trim();
             if (!p) continue;
-            // 형식: `device float* arg [[buffer(N)]]` / `constant uint& dim [[buffer(N)]]`
-            // 이름 = `[[` 앞의 마지막 identifier
+            // 형식: `device float* arg [[buffer(N)]]` / `constant uint& dim [[buffer(N)]]` (Format: `device float* arg [[buffer(N)]]` / `constant uint& dim [[buffer(N)]]`)
+            // 이름 = `[[` 앞의 마지막 identifier (Name = last identifier before `[[`)
             const beforeAttr = p.replace(/\[\[[^\]]*\]\]/g, ' ').trim();
             const nameMatch = beforeAttr.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*$/);
             const pname = nameMatch ? nameMatch[1] : `arg${pi}`;
@@ -1283,20 +1283,20 @@ class QuarkFolderEngine {
             // storage qualifier
             const sq = (p.match(/\b(device|constant|threadgroup|thread)\b/) || [])[1];
             if (sq) mkdirSync(path.join(pdir, `storage__${safeName(sq)}`));
-            // type — qualifier + reference/pointer 떼고 마지막 type token
+            // type — qualifier + reference/pointer 떼고 마지막 type token (type — stripping qualifier + reference/pointer and getting last type token)
             const typeMatch = beforeAttr.match(/^\s*(?:device\s+|constant\s+|threadgroup\s+|thread\s+)?\s*((?:const\s+)?[a-zA-Z_][a-zA-Z0-9_]*(?:\s*<[^>]*>)?(?:\s*[*&])?)/);
             if (typeMatch) mkdirSync(path.join(pdir, `type__${safeName(typeMatch[1].trim()).substring(0, 40)}`));
             // attributes
             const attrs = (p.match(/\[\[[^\]]+\]\]/g) || []);
             for (const a of attrs) {
               const inner = a.replace(/\[\[|\]\]/g, '').trim();
-              // buffer(N), thread_position_in_grid, threads_per_threadgroup 등
+              // buffer(N), thread_position_in_grid, threads_per_threadgroup 등 (buffer(N), thread_position_in_grid, threads_per_threadgroup, etc.)
               const tag = inner.replace(/\s+/g, '_').replace(/[()]/g, '_').substring(0, 40);
               mkdirSync(path.join(pdir, `attr__${safeName(tag)}`));
             }
           }
         }
-        // 본문 재귀 파싱 — MSL 은 C++ 이므로 dialect 'msl' 로
+        // 본문 재귀 파싱 — MSL 은 C++ 이므로 dialect 'msl' 로 (Recursive body parsing — MSL is C++, so dialect 'msl' is used)
         const innerBody = lines.slice(bodyStart, bodyEnd).join('\n');
         const parser = new CStyleStmtParser(innerBody, 'msl');
         const stmts = [];
@@ -1310,7 +1310,7 @@ class QuarkFolderEngine {
         }
         emitStmtList(stmts, symQuarkPath);
       } else {
-        // struct: 필드 파싱
+        // struct: 필드 파싱 (struct: parse fields)
         const innerBody = lines.slice(bodyStart, bodyEnd).join('\n');
         const fieldLines = innerBody.split(';');
         for (const fl of fieldLines) {
@@ -1351,7 +1351,7 @@ class QuarkFolderEngine {
   }
 
   // ─── Objective-C `.m` / `.mm` ───
-  // 간단한 인터페이스/구현/메소드 캡처. 깊이있는 분해는 향후 작업.
+  // 간단한 인터페이스/구현/메소드 캡처. 깊이있는 분해는 향후 작업. (Simple interface/implementation/method capture. Deep decomposition is future work.)
   processObjC(text, fileQuarkPath, relPath) {
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
@@ -1379,7 +1379,7 @@ class QuarkFolderEngine {
     }
   }
 
-  // ─── PTX (v3.1 그대로) ───
+  // ─── PTX (v3.1 그대로 - same as v3.1) ───
   processPTX(text, fileQuarkPath, relPath) {
     const PERF_DATA = CONFIG.perfData || {};
     const targetMatch = text.match(/\.target\s+([a-zA-Z0-9_]+)/);
@@ -1952,9 +1952,9 @@ Hallucination을 방지하기 위해 다음 탐색 규칙을 반드시 준수하
   }
 }
 
-// ─── 헬퍼 ───
+// ─── 헬퍼 (Helpers) ───
 function splitParamsTopLevel(text) {
-  // depth-aware comma split (Metal params 의 [[ ]] 안 콤마는 무시)
+  // depth-aware comma split (Metal params 의 [[ ]] 안 콤마는 무시 - ignores commas inside [[ ]] of Metal params)
   const out = [];
   let depth = 0, start = 0;
   for (let i = 0; i < text.length; i++) {
@@ -1970,7 +1970,7 @@ function splitParamsTopLevel(text) {
   return out;
 }
 
-// ─── Glob 파일 검색 및 매칭 헬퍼 ───
+// ─── Glob 파일 검색 및 매칭 헬퍼 (Glob File Search & Match Helpers) ───
 function getFilesRecursively(dir, files = []) {
   if (!fs.existsSync(dir)) return files;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -1991,7 +1991,7 @@ function matchGlobPattern(relPath, pattern) {
   let p = pattern.replace(/\\/g, '/');
   let rel = relPath.replace(/\\/g, '/');
   
-  // /**/ 패턴을 특수 토큰으로 보호하여 0개 이상의 폴더 매칭 지원
+  // /**/ 패턴을 특수 토큰으로 보호하여 0개 이상의 폴더 매칭 지원 (Protecting /**/ patterns as special tokens to support matching zero or more folders)
   p = p.replace(/\/\*\*\//g, '@@DOUBLE_STAR_SLASH@@');
   p = p.replace(/\*\*/g, '.*');
   p = p.replace(/\*/g, '[^/]*');
@@ -2003,7 +2003,7 @@ function matchGlobPattern(relPath, pattern) {
   return regex.test(rel);
 }
 
-// ─── main ───
+// ─── main (Main Entry Point) ───
 async function main() {
   console.log(`🔬 quarkify v1.0.0 — ${CONFIG.name} 시작...`);
   console.log(`📂 srcDir:  ${CONFIG.srcDir}`);
@@ -2015,7 +2015,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Glob 파일 스캔 및 매핑
+  // Glob 파일 스캔 및 매핑 (Glob File Scan and Mapping)
   let resolvedFiles = [];
   const hasGlob = CONFIG.sourceFiles.some(f => f.includes('*'));
   if (hasGlob) {
@@ -2054,7 +2054,7 @@ async function main() {
   console.log('🔗 액손 + by_opcode 인덱스...');
   engine.buildAxons();
 
-  // 시각화 뷰어 및 AI 가이드 자동 생성
+  // 시각화 뷰어 및 AI 가이드 자동 생성 (Automatically generate visualization viewer and AI guide)
   engine.writeHtmlViewer();
   engine.writeAiContextGuide();
 
