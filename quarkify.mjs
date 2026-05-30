@@ -53,7 +53,28 @@ if (!fs.existsSync(cfgAbs)) {
   console.error(`Config not found: ${cfgAbs}`);
   process.exit(1);
 }
-const CONFIG = (await import(pathToFileURL(cfgAbs).href)).default;
+
+let CONFIG;
+try {
+  const imported = await import(pathToFileURL(cfgAbs).href);
+  if (!imported || !imported.default) {
+    console.error(`❌ 에러: 설정 파일에 'default export'가 정의되어 있지 않습니다: "${configPath}"`);
+    process.exit(1);
+  }
+  CONFIG = imported.default;
+} catch (err) {
+  console.error(`❌ 에러: 설정 파일을 불러오는 중 오류가 발생했습니다:`, err.message);
+  process.exit(1);
+}
+
+// 필수 속성 검증
+const requiredFields = ['srcDir', 'outDir', 'sourceFiles'];
+for (const field of requiredFields) {
+  if (CONFIG[field] === undefined || CONFIG[field] === null) {
+    console.error(`❌ 에러: 설정 파일에 필수 속성 '${field}'이(가) 누락되었습니다.`);
+    process.exit(1);
+  }
+}
 
 // ─── 유틸 ───
 function safeName(name) {
@@ -2010,6 +2031,12 @@ async function main() {
     console.log(`[+] 스캔 완료: 총 ${resolvedFiles.length}개 파일 매칭됨.\n`);
   } else {
     resolvedFiles = CONFIG.sourceFiles;
+  }
+
+  if (resolvedFiles.length === 0) {
+    console.error('❌ 에러: 매칭된 소스 파일이 하나도 없습니다.');
+    console.error(`설정 파일의 'sourceFiles' 패턴(${JSON.stringify(CONFIG.sourceFiles)})과 'srcDir' 경로가 올바른지 확인해 주세요.`);
+    process.exit(1);
   }
 
   const engine = new QuarkFolderEngine(CONFIG.outDir);
