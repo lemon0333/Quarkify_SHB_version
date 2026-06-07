@@ -1988,19 +1988,40 @@ function getFilesRecursively(dir, files = []) {
 }
 
 function matchGlobPattern(relPath, pattern) {
-  let p = pattern.replace(/\\/g, '/');
-  let rel = relPath.replace(/\\/g, '/');
-  
-  // /**/ 패턴을 특수 토큰으로 보호하여 0개 이상의 폴더 매칭 지원 (Protecting /**/ patterns as special tokens to support matching zero or more folders)
-  p = p.replace(/\/\*\*\//g, '@@DOUBLE_STAR_SLASH@@');
-  p = p.replace(/\*\*/g, '.*');
-  p = p.replace(/\*/g, '[^/]*');
-  p = p.replace(/\./g, '\\.');
-  p = p.replace(/@@DOUBLE_STAR_SLASH@@/g, '/(?:.*/)?');
+  const patternSegments = pattern.replace(/\\/g, '/').split('/').filter(Boolean);
+  const relSegments = relPath.replace(/\\/g, '/').split('/').filter(Boolean);
+  const memo = new Map();
 
-  const regexStr = '^' + p + '$';
-  const regex = new RegExp(regexStr);
-  return regex.test(rel);
+  const segmentMatches = (segment, relSegment) => {
+    const escaped = segment
+      .replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+      .replace(/\*/g, '[^/]*');
+    return new RegExp(`^${escaped}$`).test(relSegment);
+  };
+
+  const matchFrom = (patternIdx, relIdx) => {
+    const key = `${patternIdx}:${relIdx}`;
+    if (memo.has(key)) return memo.get(key);
+    if (patternIdx === patternSegments.length) return relIdx === relSegments.length;
+
+    const segment = patternSegments[patternIdx];
+    let matched = false;
+    if (segment === '**') {
+      for (let nextRelIdx = relIdx; nextRelIdx <= relSegments.length; nextRelIdx++) {
+        if (matchFrom(patternIdx + 1, nextRelIdx)) {
+          matched = true;
+          break;
+        }
+      }
+    } else if (relIdx < relSegments.length && segmentMatches(segment, relSegments[relIdx])) {
+      matched = matchFrom(patternIdx + 1, relIdx + 1);
+    }
+
+    memo.set(key, matched);
+    return matched;
+  };
+
+  return matchFrom(0, 0);
 }
 
 // ─── main (Main Entry Point) ───
