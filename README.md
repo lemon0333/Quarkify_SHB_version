@@ -94,7 +94,7 @@ Once analysis completes, Quarkify physically creates three core folders, a D3 vi
 ## 🚀 Getting Started
 
 ### 1. Requirements
-* [Node.js](https://nodejs.org/) v16 or higher
+* [Node.js](https://nodejs.org/) v22.12.0 or higher
 
 ### 2. Create Configuration File
 Create a config file (`configs/*.mjs`) mapping source files and project-specific categorization.
