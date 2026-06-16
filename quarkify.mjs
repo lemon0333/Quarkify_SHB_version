@@ -33,6 +33,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { execSync } from 'child_process';
@@ -95,6 +96,7 @@ function perfBand(pct) {
 }
 
 const guessRole = CONFIG.guessRole || ((_) => 'general');
+const OUTPUT_MARKER = '.quarkify-output';
 
 // ─── PTX arg 의미 분류 (PTX Argument Classification) ───
 function classifyPtxArg(raw, opcode) {
@@ -872,6 +874,8 @@ class QuarkFolderEngine {
     for (const d of [this.quarkDir, this.mirrorDir, this.axonDir]) {
       if (fs.existsSync(d)) fs.rmSync(d, { recursive: true });
     }
+    mkdirSync(this.outputDir);
+    fs.writeFileSync(path.join(this.outputDir, OUTPUT_MARKER), 'quarkify output directory\n', 'utf-8');
     mkdirSync(this.quarkDir);
     mkdirSync(this.mirrorDir);
     mkdirSync(this.axonDir);
@@ -2024,6 +2028,40 @@ function matchGlobPattern(relPath, pattern) {
   return matchFrom(0, 0);
 }
 
+function isSamePath(a, b) {
+  return path.resolve(a) === path.resolve(b);
+}
+
+function validateOutputDir(outDir, srcDir) {
+  if (typeof outDir !== 'string' || outDir.trim() === '') {
+    throw new Error('unsafe output directory: outDir is required');
+  }
+  const resolvedOut = path.resolve(outDir);
+  const resolvedSrc = fs.realpathSync(srcDir);
+  const homeDir = os.homedir();
+  const cwd = process.cwd();
+  const root = path.parse(resolvedOut).root;
+  const existingOut = fs.existsSync(resolvedOut) ? fs.realpathSync(resolvedOut) : resolvedOut;
+
+  if (
+    isSamePath(existingOut, root) ||
+    isSamePath(existingOut, homeDir) ||
+    isSamePath(existingOut, cwd) ||
+    isSamePath(existingOut, resolvedSrc)
+  ) {
+    throw new Error(`unsafe output directory: ${resolvedOut}`);
+  }
+
+  if (fs.existsSync(existingOut)) {
+    const entries = fs.readdirSync(existingOut);
+    const hasMarker = entries.includes(OUTPUT_MARKER);
+    if (entries.length > 0 && !hasMarker) {
+      throw new Error(`output directory is not marked as Quarkify output: ${resolvedOut}`);
+    }
+  }
+  return resolvedOut;
+}
+
 // ─── main (Main Entry Point) ───
 async function main() {
   console.log(`🔬 quarkify v1.0.0 — ${CONFIG.name} 시작...`);
@@ -2035,6 +2073,7 @@ async function main() {
     console.error('설정 파일(*.mjs)의 srcDir 경로를 본인의 실제 로컬 경로로 수정해 주세요.');
     process.exit(1);
   }
+  CONFIG.outDir = validateOutputDir(CONFIG.outDir, CONFIG.srcDir);
 
   // Glob 파일 스캔 및 매핑 (Glob File Scan and Mapping)
   let resolvedFiles = [];
@@ -2091,4 +2130,7 @@ async function main() {
   console.log(` 📁 경로:             ${path.resolve(CONFIG.outDir)}`);
   console.log('=============================================\n');
 }
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err && err.message ? err.message : err);
+  process.exit(1);
+});

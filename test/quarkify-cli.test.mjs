@@ -117,3 +117,52 @@ test('segment globs support nested double-star and single-star patterns', async 
     assert.ok(fileFolders.some((name) => name.includes('Scratch.java')));
   });
 });
+
+test('outDir cannot be the same directory as srcDir', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const srcDir = path.join(tmp, 'src');
+    const configPath = path.join(tmp, 'config.mjs');
+
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, 'sample.js'), 'export function sampleThing() { return 1; }\n', 'utf8');
+    await writeConfig(configPath, `{
+      name: 'unsafe-output-regression',
+      srcDir: ${JSON.stringify(srcDir)},
+      outDir: ${JSON.stringify(srcDir)},
+      sourceFiles: ['sample.js'],
+      perfData: {},
+      guessRole() { return 'general'; },
+    }`);
+
+    const result = runQuarkify(configPath);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr || result.stdout, /unsafe output directory/i);
+  });
+});
+
+test('outDir must be empty or marked as Quarkify output', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const srcDir = path.join(tmp, 'src');
+    const outDir = path.join(tmp, 'existing');
+    const configPath = path.join(tmp, 'config.mjs');
+
+    await mkdir(srcDir, { recursive: true });
+    await mkdir(outDir, { recursive: true });
+    await writeFile(path.join(srcDir, 'sample.js'), 'export function sampleThing() { return 1; }\n', 'utf8');
+    await writeFile(path.join(outDir, 'keep.txt'), 'do not delete\n', 'utf8');
+    await writeConfig(configPath, `{
+      name: 'marked-output-regression',
+      srcDir: ${JSON.stringify(srcDir)},
+      outDir: ${JSON.stringify(outDir)},
+      sourceFiles: ['sample.js'],
+      perfData: {},
+      guessRole() { return 'general'; },
+    }`);
+
+    const result = runQuarkify(configPath);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr || result.stdout, /not marked/i);
+  });
+});
