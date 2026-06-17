@@ -35,45 +35,61 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import { Worker, isMainThread, workerData, parentPort } from 'worker_threads';
 
 // ─── CLI / 컨피그 로드 (Load CLI / Config) ───
-const configPath = process.argv[2];
-if (!configPath) {
-  console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
-  console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
-  process.exit(1);
-}
-if (!fs.existsSync(configPath)) {
-  console.error(`❌ 에러: 지정한 설정 파일을 찾을 수 없습니다: "${configPath}"`);
-  process.exit(1);
-}
-const cfgAbs = path.resolve(configPath);
-if (!fs.existsSync(cfgAbs)) {
-  console.error(`Config not found: ${cfgAbs}`);
-  process.exit(1);
-}
+// 역방향 서브커맨드(--collapse / --expand)는 config 없이 동작한다.
+// (Reverse subcommands (--collapse / --expand) run without a config.)
+const REVERSE_MODE = isMainThread && (process.argv[2] === '--collapse' || process.argv[2] === '--expand');
+// --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
+// (--k6 needs a config; its path is argv[3].)
+const K6_MODE = isMainThread && process.argv[2] === '--k6';
 
-let CONFIG;
-try {
-  const imported = await import(pathToFileURL(cfgAbs).href);
-  if (!imported || !imported.default) {
-    console.error(`❌ 에러: 설정 파일에 'default export'가 정의되어 있지 않습니다: "${configPath}"`);
+// 메인 스레드는 argv 에서, 워커 스레드는 workerData 에서 config 경로를 받는다.
+// (Main thread reads config path from argv; worker threads receive it via workerData.)
+const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) : workerData.configPath;
+let CONFIG = {};
+let cfgAbs = null;
+
+if (!REVERSE_MODE) {
+  if (!configPath) {
+    console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
+    console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
+    console.error('       node quarkify.mjs --collapse <outDir> [outFile]');
+    console.error('       node quarkify.mjs --expand <tree.json> <targetDir>');
     process.exit(1);
   }
-  CONFIG = imported.default;
-} catch (err) {
-  console.error(`❌ 에러: 설정 파일을 불러오는 중 오류가 발생했습니다:`, err.message);
-  process.exit(1);
-}
-
-// 필수 속성 검증 (Required Property Validation)
-const requiredFields = ['srcDir', 'outDir', 'sourceFiles'];
-for (const field of requiredFields) {
-  if (CONFIG[field] === undefined || CONFIG[field] === null) {
-    console.error(`❌ 에러: 설정 파일에 필수 속성 '${field}'이(가) 누락되었습니다.`);
+  if (!fs.existsSync(configPath)) {
+    console.error(`❌ 에러: 지정한 설정 파일을 찾을 수 없습니다: "${configPath}"`);
     process.exit(1);
+  }
+  cfgAbs = path.resolve(configPath);
+  if (!fs.existsSync(cfgAbs)) {
+    console.error(`Config not found: ${cfgAbs}`);
+    process.exit(1);
+  }
+
+  try {
+    const imported = await import(pathToFileURL(cfgAbs).href);
+    if (!imported || !imported.default) {
+      console.error(`❌ 에러: 설정 파일에 'default export'가 정의되어 있지 않습니다: "${configPath}"`);
+      process.exit(1);
+    }
+    CONFIG = imported.default;
+  } catch (err) {
+    console.error(`❌ 에러: 설정 파일을 불러오는 중 오류가 발생했습니다:`, err.message);
+    process.exit(1);
+  }
+
+  // 필수 속성 검증 (Required Property Validation)
+  const requiredFields = ['srcDir', 'outDir', 'sourceFiles'];
+  for (const field of requiredFields) {
+    if (CONFIG[field] === undefined || CONFIG[field] === null) {
+      console.error(`❌ 에러: 설정 파일에 필수 속성 '${field}'이(가) 누락되었습니다.`);
+      process.exit(1);
+    }
   }
 }
 
@@ -139,6 +155,24 @@ function parseJavaFields(body) {
     const m = l.match(/^\s*(?:public\s+|protected\s+|private\s+|static\s+|final\s+|transient\s+|volatile\s+)*([a-zA-Z0-9_<>\[\]]+)\s+([a-zA-Z0-9_]+)\s*(?:=\s*([^;]+))?;\s*$/);
     if (!m) continue;
     fields.push({ name: m[2].trim(), type: m[1].trim(), default: (m[3] || '').trim() });
+  }
+  return fields;
+}
+
+// ─── Kotlin class/data class/object 필드 파서 (Kotlin Property Parser) ───
+// val/var 프로퍼티만 추출. 메서드 시그니처/로컬 호출(괄호 포함 줄)과 람다(->)는 건너뛴다.
+// (Extract val/var properties only; skip method signatures / local calls (lines with parens) and lambdas.)
+function parseKotlinFields(body) {
+  const fields = [];
+  const lines = body.split('\n');
+  for (const raw of lines) {
+    let l = raw.replace(/\/\/.*/g, '').trim();
+    if (!l || l.includes('(') || l.includes(')') || l.includes('->') ||
+        l.startsWith('fun ') || l.startsWith('class ') || l.startsWith('object ') ||
+        l.startsWith('interface ')) continue;
+    const m = l.match(/^(?:(?:public|private|protected|internal|open|override|const|lateinit|final)\s+|@\w+\s+)*(?:val|var)\s+([a-zA-Z0-9_]+)\s*(?::\s*([^=]+?))?\s*(?:=\s*(.+))?$/);
+    if (!m) continue;
+    fields.push({ name: m[1].trim(), type: (m[2] || '').trim(), default: (m[3] || '').trim() });
   }
   return fields;
 }
@@ -938,6 +972,7 @@ class QuarkFolderEngine {
     let depth = 0;
     let openedOnce = false;
     let symStart = 0;
+    let parenDepth = 0; // Kotlin: 다중 라인 주 생성자/파라미터 목록 추적 (track multiline primary-constructor / param list)
     let pendingAnnotations = [];
 
     const finishSymbol = (endLine) => {
@@ -970,7 +1005,8 @@ class QuarkFolderEngine {
       }
 
       if (cur.kind === 'struct' || cur.kind === 'union' || cur.kind === 'enum' ||
-          cur.kind === 'class' || cur.kind === 'namespace' || cur.kind === 'interface' || cur.kind === 'record') {
+          cur.kind === 'class' || cur.kind === 'namespace' || cur.kind === 'interface' ||
+          cur.kind === 'record' || cur.kind === 'object') {
         const bodyOpen = body.indexOf('{');
         const bodyClose = body.lastIndexOf('}');
         if (bodyOpen >= 0 && bodyClose > bodyOpen) {
@@ -978,6 +1014,8 @@ class QuarkFolderEngine {
           let fields = [];
           if (ext === '.java') {
             fields = parseJavaFields(inner);
+          } else if (ext === '.kt' || ext === '.kts') {
+            fields = parseKotlinFields(inner);
           } else if (ext === '.ts' || ext === '.js' || ext === '.tsx' || ext === '.jsx') {
             fields = parseJSFields(inner);
           } else {
@@ -991,12 +1029,13 @@ class QuarkFolderEngine {
             else mkdirSync(path.join(fDir, `default__missing__uninit_hazard`));
           }
           // RECURSE into the container body
-          if (/(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner)) {
+          if (((ext === '.kt' || ext === '.kts') && /\b(?:fun\s+[a-zA-Z0-9_]|(?:companion\s+)?object\b|(?:data\s+|enum\s+|sealed\s+|inner\s+)?class\s+[a-zA-Z_]|interface\s+[a-zA-Z_])/.test(inner)) ||
+              /(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner)) {
             const innerLines = inner.split('\n');
             this.processCStyle(inner, innerLines, ext, symQuarkPath, relPath);
           }
         }
-      } else if (cur.kind === 'fn' && (ext === '.zig' || ext === '.java')) {
+      } else if (cur.kind === 'fn' && (ext === '.zig' || ext === '.java' || ext === '.kt' || ext === '.kts')) {
         const open = body.indexOf('{');
         const close = body.lastIndexOf('}');
         if (open >= 0 && close > open) {
@@ -1021,12 +1060,32 @@ class QuarkFolderEngine {
       cur = null;
     };
 
+    // Kotlin 전용 심볼 종료 판정 (Kotlin-specific symbol completion):
+    //  - 괄호 안(주 생성자/파라미터)이면 헤더가 끝나지 않았으므로 계속 누적
+    //  - 블록 바디 `{`를 봤으면 brace depth 가 0 으로 닫힐 때 종료
+    //  - 바디 `{`가 없으면(표현식 바디 `=`, data class 한 줄, 추상 fun, val/var) 해당 줄에서 종료
+    //    단, 바로 다음 비어있지 않은 줄이 `{`로 시작하면 블록 바디가 따라오는 것이므로 대기
+    const isKt = (ext === '.kt' || ext === '.kts');
+    const tryFinishKotlin = (i, openers, closers, oparens, cparens) => {
+      parenDepth += oparens - cparens;
+      depth += openers - closers;
+      if (openers > 0) openedOnce = true;
+      if (parenDepth > 0) return;
+      if (openedOnce) { if (depth <= 0) finishSymbol(i + 1); return; }
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() === '') j++;
+      if (j < lines.length && lines[j].trim().startsWith('{')) return;
+      finishSymbol(i + 1);
+    };
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const stripped = line.replace(/"(?:[^"\\]|\\.)*"/g, '').replace(/\/\/.*/g, '');
       const openers = (stripped.match(/\{/g) || []).length;
       const closers = (stripped.match(/\}/g) || []).length;
-      if (ext === '.java' && !cur) {
+      const oparens = (stripped.match(/\(/g) || []).length;
+      const cparens = (stripped.match(/\)/g) || []).length;
+      if ((ext === '.java' || isKt) && !cur) {
         const annM = line.match(/^\s*@([a-zA-Z0-9_]+)(?:\((.*)\))?/);
         if (annM) {
           pendingAnnotations.push({ name: annM[1], args: annM[2] || '' });
@@ -1092,17 +1151,44 @@ class QuarkFolderEngine {
           } else if ((m = line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?function\b/))) {
             name = m[1]; kind = 'fn'; role = guessRole(name);
           }
+        } else if (isKt) {
+          const trimmed = line.trim();
+          const KMOD = '(?:(?:public|private|protected|internal|open|abstract|sealed|final|inner|value|annotation|data|override|inline|suspend|operator|infix|tailrec|external|const|lateinit|companion)\\s+)*';
+          if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*') ||
+              trimmed.length === 0 || trimmed.startsWith('package ') || trimmed.startsWith('import ') ||
+              trimmed.startsWith('@')) {
+            // 주석 / package / import / 단독 어노테이션 줄 (annotations captured separately above)
+          } else if ((m = line.match(new RegExp(`^\\s*${KMOD}enum\\s+class\\s+([a-zA-Z0-9_]+)`)))) {
+            name = m[1]; kind = 'enum'; role = 'type';
+          } else if ((m = line.match(/^\s*companion\s+object(?:\s+([a-zA-Z0-9_]+))?/))) {
+            name = m[1] || 'Companion'; kind = 'object'; role = 'type';
+          } else if ((m = line.match(new RegExp(`^\\s*${KMOD}(class|interface|object)\\s+([a-zA-Z0-9_]+)`)))) {
+            name = m[2]; kind = (m[1] === 'object' ? 'object' : m[1]);
+            // 클래스명 기반 역할(controller/service 등)을 우선 적용, 없으면 'type'
+            const r = guessRole(name); role = (r && r !== 'general') ? r : 'type';
+          } else if ((m = line.match(new RegExp(`^\\s*${KMOD}fun\\s+(?:<[^>]+>\\s*)?(?:[a-zA-Z0-9_<>.?]+\\.)?([a-zA-Z0-9_]+)\\s*\\(`)))) {
+            name = m[1]; kind = 'fn'; role = guessRole(name);
+          } else if ((m = line.match(new RegExp(`^\\s*${KMOD}(?:val|var)\\s+([a-zA-Z0-9_]+)\\s*[:=]`)))) {
+            name = m[1]; kind = 'var'; role = 'state';
+          }
         }
         if (name) {
           cur = { name, kind, role };
           cur.annotations = pendingAnnotations;
           pendingAnnotations = [];
           symStart = i;
-          depth = openers - closers;
-          openedOnce = openers > 0;
-          if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
-          else if (openedOnce && depth <= 0) finishSymbol(i + 1);
+          if (isKt) {
+            depth = 0; openedOnce = false; parenDepth = 0;
+            tryFinishKotlin(i, openers, closers, oparens, cparens);
+          } else {
+            depth = openers - closers;
+            openedOnce = openers > 0;
+            if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
+            else if (openedOnce && depth <= 0) finishSymbol(i + 1);
+          }
         }
+      } else if (isKt) {
+        tryFinishKotlin(i, openers, closers, oparens, cparens);
       } else {
         depth += openers - closers;
         if (openers > 0) openedOnce = true;
@@ -1591,6 +1677,26 @@ class QuarkFolderEngine {
     }
   }
 
+  // 워커가 반환한 인메모리 누적 결과를 병합 (Merge a worker's accumulated in-memory result).
+  // 폴더 산출물은 워커가 이미 디스크에 기록했으므로, 여기서는 미러/opcode/perf 메타만 합친다.
+  // (Workers already wrote folders to disk; here we only merge the mirror/opcode/perf metadata.)
+  mergeWorkerResult(r) {
+    if (!r) return;
+    for (const category of Object.keys(this.mirrors)) {
+      const src = r.mirrors && r.mirrors[category];
+      if (!src) continue;
+      for (const [key, paths] of Object.entries(src)) {
+        if (!this.mirrors[category][key]) this.mirrors[category][key] = [];
+        this.mirrors[category][key].push(...paths);
+      }
+    }
+    for (const [op, sites] of Object.entries(r.byOpcodeSites || {})) {
+      if (!this.byOpcodeSites[op]) this.byOpcodeSites[op] = [];
+      this.byOpcodeSites[op].push(...sites);
+    }
+    this.perfEntries += r.perfEntries || 0;
+  }
+
   buildMirrors() {
     for (const [category, entries] of Object.entries(this.mirrors)) {
       const categoryDir = path.join(this.mirrorDir, category);
@@ -1899,7 +2005,7 @@ class QuarkFolderEngine {
 </html>`;
     const outPath = path.join(this.outputDir, 'index.html');
     fs.writeFileSync(outPath, htmlContent, 'utf-8');
-    console.log(`[+] 인터랙티브 HTML 뷰어 빌드 완료: \${outPath}`);
+    console.log(`[+] 인터랙티브 HTML 뷰어 빌드 완료: ${outPath}`);
   }
 
   writeAiContextGuide() {
@@ -1952,7 +2058,7 @@ Hallucination을 방지하기 위해 다음 탐색 규칙을 반드시 준수하
 `;
     const outPath = path.join(this.outputDir, 'ai_context_guide.txt');
     fs.writeFileSync(outPath, text, 'utf-8');
-    console.log(`[+] AI 컨텍스트 가이드 지침서 작성 완료: \${outPath}`);
+    console.log(`[+] AI 컨텍스트 가이드 지침서 작성 완료: ${outPath}`);
   }
 }
 
@@ -2062,6 +2168,22 @@ function validateOutputDir(outDir, srcDir) {
   return resolvedOut;
 }
 
+// CONFIG.sourceFiles 를 실제 상대경로 목록으로 해석 (글로브 지원). main 과 --k6 가 공유.
+// (Resolve CONFIG.sourceFiles to a list of relative paths, supporting globs. Shared by main and --k6.)
+function resolveSourceFiles({ verbose = false } = {}) {
+  const hasGlob = CONFIG.sourceFiles.some(f => f.includes('*'));
+  if (!hasGlob) return CONFIG.sourceFiles;
+  if (verbose) console.log('🔍 Glob 패턴 감지됨. 소스 디렉터리 스캔 중...');
+  const resolved = [];
+  const allFiles = getFilesRecursively(CONFIG.srcDir);
+  for (const fileAbs of allFiles) {
+    const fileRel = path.relative(CONFIG.srcDir, fileAbs);
+    if (CONFIG.sourceFiles.some(pat => matchGlobPattern(fileRel, pat))) resolved.push(fileRel);
+  }
+  if (verbose) console.log(`[+] 스캔 완료: 총 ${resolved.length}개 파일 매칭됨.\n`);
+  return resolved;
+}
+
 // ─── main (Main Entry Point) ───
 async function main() {
   console.log(`🔬 quarkify v1.0.0 — ${CONFIG.name} 시작...`);
@@ -2076,22 +2198,7 @@ async function main() {
   CONFIG.outDir = validateOutputDir(CONFIG.outDir, CONFIG.srcDir);
 
   // Glob 파일 스캔 및 매핑 (Glob File Scan and Mapping)
-  let resolvedFiles = [];
-  const hasGlob = CONFIG.sourceFiles.some(f => f.includes('*'));
-  if (hasGlob) {
-    console.log('🔍 Glob 패턴 감지됨. 소스 디렉터리 스캔 중...');
-    const allFiles = getFilesRecursively(CONFIG.srcDir);
-    for (const fileAbs of allFiles) {
-      const fileRel = path.relative(CONFIG.srcDir, fileAbs);
-      const isMatched = CONFIG.sourceFiles.some(pat => matchGlobPattern(fileRel, pat));
-      if (isMatched) {
-        resolvedFiles.push(fileRel);
-      }
-    }
-    console.log(`[+] 스캔 완료: 총 ${resolvedFiles.length}개 파일 매칭됨.\n`);
-  } else {
-    resolvedFiles = CONFIG.sourceFiles;
-  }
+  const resolvedFiles = resolveSourceFiles({ verbose: true });
 
   if (resolvedFiles.length === 0) {
     console.error('❌ 에러: 매칭된 소스 파일이 하나도 없습니다.');
@@ -2102,11 +2209,29 @@ async function main() {
   const engine = new QuarkFolderEngine(CONFIG.outDir);
   engine.init();
 
+  // 존재하는 파일만 추려서 작업 목록 구성 (Build the work list of existing files only)
+  const jobs = [];
   for (const rel of resolvedFiles) {
     const abs = path.join(CONFIG.srcDir, rel);
     if (!fs.existsSync(abs)) { console.log(`[-] 건너뜀: ${rel}`); continue; }
-    console.log(`[+] 분해 중: ${rel}`);
-    engine.processFile(abs, rel);
+    jobs.push({ abs, rel });
+  }
+
+  const workerCount = resolveWorkerCount(jobs.length);
+  if (workerCount <= 1) {
+    // ─── 순차 처리 (Sequential) ───
+    for (const { abs, rel } of jobs) {
+      console.log(`[+] 분해 중: ${rel}`);
+      engine.processFile(abs, rel);
+    }
+  } else {
+    // ─── 병렬 처리 (Parallel via worker_threads) ───
+    console.log(`⚙️  병렬 처리: ${jobs.length}개 파일 → ${workerCount}개 워커`);
+    const chunks = chunkEvenly(jobs, workerCount);
+    const results = await Promise.all(
+      chunks.map((chunk, idx) => runWorkerChunk(chunk, CONFIG.outDir, cfgAbs, idx))
+    );
+    for (const r of results) engine.mergeWorkerResult(r);
   }
 
   console.log('\n🪞 미러 구성...');
@@ -2130,7 +2255,373 @@ async function main() {
   console.log(` 📁 경로:             ${path.resolve(CONFIG.outDir)}`);
   console.log('=============================================\n');
 }
-main().catch((err) => {
-  console.error(err && err.message ? err.message : err);
-  process.exit(1);
-});
+// ─── 병렬 처리 유틸 (Parallelism Utilities) ───
+
+// 워커 수 결정 (Decide worker count).
+// 우선순위: CONFIG.concurrency > env QUARKIFY_CONCURRENCY > 자동(cpu-1).
+// 파일 수가 적으면(<MIN_PARALLEL_FILES) 워커 띄우는 오버헤드가 더 크므로 순차(=1).
+function resolveWorkerCount(fileCount) {
+  const MIN_PARALLEL_FILES = 16;
+  const explicit = CONFIG.concurrency ?? process.env.QUARKIFY_CONCURRENCY;
+  let want;
+  if (explicit !== undefined && explicit !== null && explicit !== '') {
+    want = parseInt(explicit, 10);
+    if (!Number.isFinite(want) || want < 1) want = 1;
+  } else {
+    if (fileCount < MIN_PARALLEL_FILES) return 1;
+    want = Math.max(1, (os.cpus()?.length || 1) - 1);
+  }
+  // 워커당 최소 몇 개 파일은 맡도록 상한 조정 (Cap so each worker handles a few files)
+  return Math.max(1, Math.min(want, Math.ceil(fileCount / 4), fileCount));
+}
+
+// 작업을 워커 수만큼 거의 균등하게 분할 (Split jobs into ~even chunks)
+function chunkEvenly(items, n) {
+  const chunks = Array.from({ length: n }, () => []);
+  for (let i = 0; i < items.length; i++) chunks[i % n].push(items[i]);
+  return chunks.filter((c) => c.length > 0);
+}
+
+// 워커 하나를 띄워 청크를 처리하고, 누적된 mirror/opcode/perf 메타를 받아온다.
+// (Spawn a worker to process a chunk and collect its accumulated metadata.)
+function runWorkerChunk(jobs, outDir, configPath, idx) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(fileURLToPath(import.meta.url), {
+      workerData: { jobs, outDir, configPath },
+    });
+    worker.once('message', (msg) => resolve(msg));
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`워커 #${idx} 비정상 종료 (exit code ${code})`));
+    });
+  });
+}
+
+// 워커 스레드 진입점: 할당된 파일들을 처리하고 메타를 부모로 전송.
+// init() 은 메인에서 1회만 수행하므로 워커는 절대 호출하지 않는다 (출력 디렉터리를 지워버림).
+// (Worker entry point: process assigned files, post metadata back. Never call init() — main owns it.)
+async function runWorker() {
+  const { jobs, outDir } = workerData;
+  const engine = new QuarkFolderEngine(outDir);
+  for (const { abs, rel } of jobs) {
+    try {
+      engine.processFile(abs, rel);
+    } catch (err) {
+      console.error(`[!] 워커 처리 실패: ${rel} — ${err && err.message ? err.message : err}`);
+    }
+  }
+  parentPort.postMessage({
+    mirrors: engine.mirrors,
+    byOpcodeSites: engine.byOpcodeSites,
+    perfEntries: engine.perfEntries,
+  });
+}
+
+// ─── 역방향: 폴더 트리 ↔ 단일 파일 (Reverse: folder tree <-> single file) ───
+// ⚠️ 주의: forward 변환은 손실(lossy)이라 '원본 소스 코드' 복원은 불가능하다.
+//    아래 collapse/expand 는 "폴더 토폴로지 ↔ 단일 JSON" 사이의 무손실 왕복만 보장한다.
+//    (forward is lossy; these only round-trip the folder topology, not the original source.)
+
+// 디렉터리 서브트리를 중첩 객체로 직렬화. 모든 quark 폴더는 비어있는 디렉터리이므로
+// {폴더명: {자식...}} 형태면 완전한 표현이 된다. (Serialize a dir subtree to nested object.)
+function collapseTree(dir) {
+  const out = {};
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    throw new Error(`디렉터리를 읽을 수 없습니다: ${dir} (${err.message})`);
+  }
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const e of entries) {
+    if (e.isDirectory()) out[e.name] = collapseTree(path.join(dir, e.name));
+  }
+  return out;
+}
+
+// 중첩 객체의 노드 수(=폴더 수) 카운트 (Count nodes in the nested tree)
+function countTreeNodes(node) {
+  let n = 0;
+  for (const child of Object.values(node)) { n++; n += countTreeNodes(child); }
+  return n;
+}
+
+// 사람이 읽을 수 있는 들여쓰기 트리 텍스트 (Human-readable indented tree text)
+function renderTreeText(node, prefix = '') {
+  const keys = Object.keys(node);
+  let out = '';
+  keys.forEach((key, i) => {
+    const last = i === keys.length - 1;
+    out += `${prefix}${last ? '└── ' : '├── '}${key}\n`;
+    out += renderTreeText(node[key], prefix + (last ? '    ' : '│   '));
+  });
+  return out;
+}
+
+// 중첩 객체를 다시 폴더 트리로 실체화 (Re-materialize the nested object into folders)
+function expandTree(node, targetDir) {
+  mkdirSync(targetDir);
+  for (const [name, child] of Object.entries(node)) {
+    expandTree(child, path.join(targetDir, name));
+  }
+}
+
+async function runCollapse() {
+  const target = process.argv[3];
+  if (!target) {
+    console.error('사용법: node quarkify.mjs --collapse <outDir|quarkDir> [outFile.json]');
+    process.exit(1);
+  }
+  const resolved = path.resolve(target);
+  if (!fs.existsSync(resolved)) {
+    console.error(`❌ 에러: 경로가 존재하지 않습니다: ${resolved}`);
+    process.exit(1);
+  }
+  // <outDir>/quark 가 있으면 그걸, 아니면 주어진 경로 자체를 collapse.
+  const quarkSub = path.join(resolved, 'quark');
+  const rootDir = fs.existsSync(quarkSub) ? quarkSub : resolved;
+  const rootName = path.basename(rootDir);
+
+  console.log(`🗜️  collapse: ${rootDir} → 단일 파일`);
+  const tree = { [rootName]: collapseTree(rootDir) };
+  const nodeCount = countTreeNodes(tree);
+
+  const outFile = process.argv[4]
+    ? path.resolve(process.argv[4])
+    : path.join(resolved, 'quark_tree.json');
+  const txtFile = outFile.replace(/\.json$/i, '') + '.txt';
+
+  fs.writeFileSync(outFile, JSON.stringify(tree), 'utf-8');
+  fs.writeFileSync(txtFile, renderTreeText(tree), 'utf-8');
+
+  const jsonKb = (fs.statSync(outFile).size / 1024).toFixed(1);
+  console.log('=============================================');
+  console.log(' 🎉 collapse 완료!');
+  console.log('=============================================');
+  console.log(` ⚛️  폴더(노드) 수:   ${nodeCount}`);
+  console.log(` 📄 JSON:             ${outFile} (${jsonKb} KB)`);
+  console.log(` 📄 트리 텍스트:      ${txtFile}`);
+  console.log(` ↩️  복원:            node quarkify.mjs --expand "${outFile}" <targetDir>`);
+  console.log('=============================================\n');
+}
+
+async function runExpand() {
+  const treeFile = process.argv[3];
+  const targetDir = process.argv[4];
+  if (!treeFile || !targetDir) {
+    console.error('사용법: node quarkify.mjs --expand <tree.json> <targetDir>');
+    process.exit(1);
+  }
+  const resolvedTree = path.resolve(treeFile);
+  if (!fs.existsSync(resolvedTree)) {
+    console.error(`❌ 에러: 트리 파일이 존재하지 않습니다: ${resolvedTree}`);
+    process.exit(1);
+  }
+  let tree;
+  try {
+    tree = JSON.parse(fs.readFileSync(resolvedTree, 'utf-8'));
+  } catch (err) {
+    console.error(`❌ 에러: JSON 파싱 실패: ${err.message}`);
+    process.exit(1);
+  }
+  const resolvedTarget = path.resolve(targetDir);
+  console.log(`🌳 expand: ${resolvedTree} → ${resolvedTarget}`);
+  expandTree(tree, resolvedTarget);
+  const nodeCount = countTreeNodes(tree);
+  console.log('=============================================');
+  console.log(' 🎉 expand 완료!');
+  console.log('=============================================');
+  console.log(` ⚛️  복원된 폴더 수:  ${nodeCount}`);
+  console.log(` 📁 경로:             ${resolvedTarget}`);
+  console.log('=============================================\n');
+}
+
+// ─── k6 부하테스트 생성 (k6 Load-test Generation) ───
+// 정확도를 위해 quark 폴더(손실됨)가 아니라 *원본 소스*에서 엔드포인트를 추출한다.
+// (Extract endpoints from the original source — not the lossy quark tree — for accurate URLs.)
+
+const SPRING_METHOD = { GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', DeleteMapping: 'DELETE', PatchMapping: 'PATCH' };
+
+// 어노테이션 인자 문자열에서 경로 추출 (value=/path=/첫 문자열 리터럴)
+function annPathArg(body) {
+  if (!body) return '';
+  let m = body.match(/(?:value|path)\s*=\s*["']([^"']*)["']/);
+  if (m) return m[1];
+  m = body.match(/["']([^"']*)["']/);
+  return m ? m[1] : '';
+}
+
+function joinPath(base, sub) {
+  let b = (base || '').trim();
+  let s = (sub || '').trim();
+  if (b && !b.startsWith('/')) b = '/' + b;
+  if (b.endsWith('/')) b = b.slice(0, -1);
+  if (s && !s.startsWith('/')) s = '/' + s;
+  const joined = (b + s) || '/';
+  return joined.replace(/\/{2,}/g, '/');
+}
+
+// Spring(@RestController) — Java/Kotlin 공용 (shared by Java/Kotlin)
+function extractSpringEndpoints(text) {
+  const endpoints = [];
+  // 클래스 베이스 경로: 첫 메서드 매핑 이전에 나오는 @RequestMapping 의 경로 (class-level base)
+  const firstMethodIdx = (() => {
+    const m = text.match(/@(?:Get|Post|Put|Delete|Patch)Mapping\b/);
+    return m ? m.index : text.length;
+  })();
+  let basePath = '';
+  const baseRe = /@RequestMapping\s*(?:\(([^)]*)\))?/g;
+  let bm;
+  while ((bm = baseRe.exec(text)) !== null) {
+    if (bm.index >= firstMethodIdx) break;
+    const p = annPathArg(bm[1] || '');
+    if (p) { basePath = p; }
+  }
+  // 메서드 매핑들 (@GetMapping 등)
+  const re = /@(Get|Post|Put|Delete|Patch)Mapping\s*(?:\(([^)]*)\))?/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const method = SPRING_METHOD[`${m[1]}Mapping`];
+    const sub = annPathArg(m[2] || '');
+    endpoints.push({ method, path: joinPath(basePath, sub) });
+  }
+  // @RequestMapping(method = RequestMethod.GET, value="/x") 형태의 메서드 매핑
+  const rm = /@RequestMapping\s*\(([^)]*method\s*=\s*RequestMethod\.[^)]*)\)/g;
+  while ((m = rm.exec(text)) !== null) {
+    const methodM = m[1].match(/RequestMethod\.(\w+)/);
+    if (!methodM) continue;
+    endpoints.push({ method: methodM[1].toUpperCase(), path: joinPath(basePath, annPathArg(m[1])) });
+  }
+  return endpoints;
+}
+
+// FastAPI / Flask 스타일 — @router.get("/x") / @app.post("/x") (prefix 는 추정 불가하므로 무시)
+function extractFastApiEndpoints(text) {
+  const endpoints = [];
+  const re = /@\s*(?:\w+)\.(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    endpoints.push({ method: m[1].toUpperCase(), path: joinPath('', m[2]) });
+  }
+  return endpoints;
+}
+
+function extractEndpoints(text, ext) {
+  if (ext === '.java' || ext === '.kt' || ext === '.kts') return extractSpringEndpoints(text);
+  if (ext === '.py') return extractFastApiEndpoints(text);
+  return [];
+}
+
+function generateK6Script(endpoints, baseUrl, name) {
+  const eps = endpoints.map((e) => ({
+    method: e.method,
+    // 경로 파라미터({id}, :id)는 샘플값 '1' 로 치환 (substitute path params with sample '1')
+    path: (e.path.replace(/\{[^}]+\}/g, '1').replace(/:[a-zA-Z_]\w*/g, '1')) || '/',
+  }));
+  return `import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+// ⚛️ Quarkify auto-generated k6 load test — ${name}
+// ⚠️ 경로 파라미터({id} 등)는 샘플값 '1'로 치환됨. POST/PUT/PATCH 바디는 빈 객체이니 실제 값으로 조정하세요.
+// 실행: k6 run loadtest.k6.js   |   BASE_URL=https://api.example.com VUS=50 DURATION=1m k6 run loadtest.k6.js
+
+export const options = {
+  vus: Number(__ENV.VUS || 10),
+  duration: __ENV.DURATION || '30s',
+  thresholds: {
+    http_req_failed: ['rate<0.05'],
+    http_req_duration: ['p(95)<800'],
+  },
+};
+
+const BASE = __ENV.BASE_URL || ${JSON.stringify(baseUrl)};
+
+const endpoints = ${JSON.stringify(eps, null, 2)};
+
+export default function () {
+  for (const ep of endpoints) {
+    const url = BASE + ep.path;
+    const hasBody = ep.method === 'POST' || ep.method === 'PUT' || ep.method === 'PATCH';
+    const params = { headers: { 'Content-Type': 'application/json' }, tags: { name: ep.method + ' ' + ep.path } };
+    const res = http.request(ep.method, url, hasBody ? '{}' : null, params);
+    check(res, { 'status < 500': (r) => r.status < 500 });
+  }
+  sleep(1);
+}
+`;
+}
+
+async function runK6() {
+  if (!configPath) {
+    console.error('사용법: node quarkify.mjs --k6 <config.mjs> [baseUrl]');
+    process.exit(1);
+  }
+  if (!fs.existsSync(CONFIG.srcDir)) {
+    console.error(`❌ 에러: srcDir 가 존재하지 않습니다: "${CONFIG.srcDir}"`);
+    process.exit(1);
+  }
+  const baseUrl = process.argv[4] || 'http://localhost:8080';
+  console.log(`🎯 k6 부하테스트 생성 — ${CONFIG.name} (base: ${baseUrl})`);
+
+  const files = resolveSourceFiles({ verbose: false });
+  const seen = new Set();
+  const endpoints = [];
+  let scanned = 0;
+  for (const rel of files) {
+    const abs = path.join(CONFIG.srcDir, rel);
+    if (!fs.existsSync(abs)) continue;
+    scanned++;
+    const text = fs.readFileSync(abs, 'utf-8');
+    for (const ep of extractEndpoints(text, path.extname(abs))) {
+      const key = `${ep.method} ${ep.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      endpoints.push(ep);
+    }
+  }
+
+  if (endpoints.length === 0) {
+    console.error(`❌ 엔드포인트를 찾지 못했습니다. (스캔 ${scanned}개 파일)`);
+    console.error('Spring(@GetMapping 등) 또는 FastAPI(@router.get 등) 컨트롤러가 sourceFiles 에 포함됐는지 확인하세요.');
+    process.exit(1);
+  }
+
+  const outDir = path.resolve(CONFIG.outDir);
+  ensureDir(outDir);
+  const outFile = path.join(outDir, 'loadtest.k6.js');
+  fs.writeFileSync(outFile, generateK6Script(endpoints, baseUrl, CONFIG.name), 'utf-8');
+
+  console.log('=============================================');
+  console.log(' 🎉 k6 부하테스트 생성 완료!');
+  console.log('=============================================');
+  console.log(` 🎯 엔드포인트:       ${endpoints.length}개`);
+  for (const ep of endpoints.slice(0, 12)) console.log(`    ${ep.method.padEnd(6)} ${ep.path}`);
+  if (endpoints.length > 12) console.log(`    ... 외 ${endpoints.length - 12}개`);
+  console.log(` 📄 스크립트:         ${outFile}`);
+  console.log(` ▶️  실행:            k6 run "${outFile}"`);
+  console.log('=============================================\n');
+}
+
+// ─── 진입점 분기 (Entry-point dispatch) ───
+if (!isMainThread) {
+  runWorker().catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+} else if (K6_MODE) {
+  runK6().catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+} else if (REVERSE_MODE) {
+  const reverse = process.argv[2] === '--collapse' ? runCollapse : runExpand;
+  reverse().catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+} else {
+  main().catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+}
