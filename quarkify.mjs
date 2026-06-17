@@ -943,6 +943,7 @@ class QuarkFolderEngine {
     this.axons = [];
     this.byOpcodeSites = {};
     this.perfEntries = 0;
+    this.symbols = []; // {name,kind,role,file,quark,startLine,endLine,signature} — quark_meta.json + 콜그래프 토대
   }
 
   init() {
@@ -990,22 +991,31 @@ class QuarkFolderEngine {
 
     emitPythonList(nodes, fileQuarkPath);
 
-    const registerMirrorsRecursively = (n) => {
+    const registerMirrorsRecursively = (n, parentPath = fileQuarkPath) => {
+      let symPath = null, kind = null, role = null;
       if (n.kind === 'class') {
-        this.registerMirror('class', 'type', relPath, path.relative(this.quarkDir, path.join(fileQuarkPath, `class__${safeName(n.name)}`)));
+        kind = 'class'; role = 'type';
+        symPath = path.join(parentPath, `class__${safeName(n.name)}`);
       } else if (n.kind === 'fn') {
-        const role = guessRole(n.name);
-        this.registerMirror('fn', role, relPath, path.relative(this.quarkDir, path.join(fileQuarkPath, `fn__${safeName(n.name)}`)));
+        kind = 'fn'; role = guessRole(n.name);
+        symPath = path.join(parentPath, `fn__${safeName(n.name)}`);
+      }
+      if (symPath) {
+        const rel = path.relative(this.quarkDir, symPath);
+        this.registerMirror(kind, role, relPath, rel);
+        this.symbols.push({ name: n.name, kind, role, file: relPath, quark: rel,
+          startLine: n.lineNo || null, endLine: null, signature: (n.line || n.name || '').trim().slice(0, 200) });
       }
       if (n.body) {
-        for (const child of n.body) registerMirrorsRecursively(child);
+        const childParent = symPath || parentPath;
+        for (const child of n.body) registerMirrorsRecursively(child, childParent);
       }
     };
     for (const n of nodes) registerMirrorsRecursively(n);
   }
 
   // ─── Zig / CUDA C++ (.cu/.cuh) ───
-  processCStyle(text, lines, ext, fileQuarkPath, relPath) {
+  processCStyle(text, lines, ext, fileQuarkPath, relPath, lineOffset = 0) {
     let cur = null;
     let depth = 0;
     let openedOnce = false;
@@ -1079,7 +1089,10 @@ class QuarkFolderEngine {
             (isKtContainer && /\b(?:fun\s+[a-zA-Z0-9_]|(?:companion\s+)?object\b|(?:data\s+|enum\s+|sealed\s+|inner\s+)?class\s+[a-zA-Z_]|interface\s+[a-zA-Z_])/.test(inner)) ||
             /(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner))) {
           const innerLines = inner.split('\n');
-          this.processCStyle(inner, innerLines, ext, symQuarkPath, relPath);
+          // inner 의 절대 시작 줄 = 현재 프레임 오프셋 + 심볼 시작 + body 내 inner 앞 줄바꿈 수
+          const newlinesBeforeInner = (body.substring(0, bodyOpen + 1).match(/\n/g) || []).length;
+          const innerOffset = lineOffset + symStart + newlinesBeforeInner;
+          this.processCStyle(inner, innerLines, ext, symQuarkPath, relPath, innerOffset);
         }
       } else if (cur.kind === 'fn' && (ext === '.zig' || ext === '.java' || ext === '.kt' || ext === '.kts')) {
         const open = body.indexOf('{');
@@ -1103,6 +1116,15 @@ class QuarkFolderEngine {
       }
 
       this.registerMirror(cur.kind, cur.role, relPath, path.relative(this.quarkDir, symQuarkPath));
+      // 심볼 메타데이터 기록 (jump-to-source 그라운딩 + 콜그래프 토대)
+      const sig = (body.split('\n').find((l) => l.trim()) || '').trim().slice(0, 200);
+      this.symbols.push({
+        name: cur.name, kind: cur.kind, role: cur.role, file: relPath,
+        quark: path.relative(this.quarkDir, symQuarkPath),
+        startLine: lineOffset + symStart + 1,
+        endLine: lineOffset + endLine,
+        signature: sig,
+      });
       cur = null;
     };
 
@@ -1740,7 +1762,55 @@ class QuarkFolderEngine {
       if (!this.byOpcodeSites[op]) this.byOpcodeSites[op] = [];
       this.byOpcodeSites[op].push(...sites);
     }
+    if (r.symbols) this.symbols.push(...r.symbols);
     this.perfEntries += r.perfEntries || 0;
+  }
+
+  // 심볼 메타데이터를 단일 JSON 으로 출력 (file:line 그라운딩 → AI 할루시네이션 억제)
+  writeSymbolMeta() {
+    const outFile = path.join(this.outputDir, 'quark_meta.json');
+    fs.writeFileSync(outFile, JSON.stringify({ count: this.symbols.length, symbols: this.symbols }), 'utf-8');
+    return outFile;
+  }
+
+  // 진짜 콜그래프: call__X 사이트를 실제 정의 심볼 quark 로 연결.
+  // 각 call__X 폴더 밑에 resolves_to__<정의 quark 경로> 폴더를 만들어 엣지를 물리화한다.
+  // (True call graph: link each call__X site to the defining symbol's quark by name.)
+  buildCallGraph() {
+    const CALLABLE = new Set(['fn', 'method', 'kernel', 'device_fn', 'host_fn']);
+    // null-proto 객체: callee 가 'toString'/'constructor' 등 Object.prototype 키와 충돌하지 않게.
+    const defIndex = Object.create(null); // 단순명 -> Set(quark 경로)
+    const add = (k, v) => { (defIndex[k] || (defIndex[k] = new Set())).add(v); };
+    for (const s of this.symbols) {
+      if (!CALLABLE.has(s.kind)) continue;
+      add(s.name, s.quark);
+      if (s.name.includes('__')) add(s.name.split('__').pop(), s.quark); // C++ Class__method
+    }
+    let edges = 0;
+    const callPrefix = 'call__';
+    const walk = (dir) => {
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        if (e.name.startsWith(callPrefix)) {
+          const callee = e.name.slice(callPrefix.length);
+          const defs = defIndex[callee];
+          if (defs) {
+            for (const d of defs) {
+              mkdirSync(path.join(dir, e.name, `resolves_to__${safeName(d).substring(0, 90)}`));
+              edges++;
+            }
+          }
+          // call__ 은 잎으로 취급, 더 안 내려간다
+        } else {
+          walk(path.join(dir, e.name));
+        }
+      }
+    };
+    walk(this.quarkDir);
+    this.callEdges = edges;
+    return edges;
   }
 
   buildMirrors() {
@@ -2284,6 +2354,10 @@ async function main() {
   engine.buildMirrors();
   console.log('🔗 액손 + by_opcode 인덱스...');
   engine.buildAxons();
+  console.log('🧬 콜그래프 링크...');
+  const callEdges = engine.buildCallGraph();
+  console.log('📇 심볼 메타데이터(quark_meta.json)...');
+  engine.writeSymbolMeta();
 
   // 시각화 뷰어 및 AI 가이드 자동 생성 (Automatically generate visualization viewer and AI guide)
   engine.writeHtmlViewer();
@@ -2360,6 +2434,7 @@ async function runWorker() {
     mirrors: engine.mirrors,
     byOpcodeSites: engine.byOpcodeSites,
     perfEntries: engine.perfEntries,
+    symbols: engine.symbols,
   });
 }
 
