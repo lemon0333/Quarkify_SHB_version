@@ -43,6 +43,9 @@ import { Worker, isMainThread, workerData, parentPort } from 'worker_threads';
 // 역방향 서브커맨드(--collapse / --expand)는 config 없이 동작한다.
 // (Reverse subcommands (--collapse / --expand) run without a config.)
 const REVERSE_MODE = isMainThread && (process.argv[2] === '--collapse' || process.argv[2] === '--expand');
+// 문서 서브커맨드(--doc / --doc-join)도 config 없이, 파일 경로만 받아 동작한다.
+// (Document subcommands also run config-less, taking a file path directly.)
+const DOC_MODE = isMainThread && (process.argv[2] === '--doc' || process.argv[2] === '--doc-join');
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -53,7 +56,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE) {
+if (!REVERSE_MODE && !DOC_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -114,6 +117,23 @@ function perfBand(pct) {
 const guessRole = CONFIG.guessRole || ((_) => 'general');
 const OUTPUT_MARKER = '.quarkify-output';
 
+// Python 인터프리터 버전을 프로세스당 1회만 조회해 캐시 (이전: .py 파일마다 execSync 호출 → 느림).
+// (Query the Python interpreter version once per process and cache it — previously execSync ran per .py file.)
+let __pyVersionClean;
+function getPythonVersionClean() {
+  if (__pyVersionClean !== undefined) return __pyVersionClean;
+  let pyVer = 'unknown';
+  try {
+    pyVer = execSync('python3 --version', { encoding: 'utf8' }).trim();
+  } catch {
+    try {
+      pyVer = execSync('python --version', { encoding: 'utf8' }).trim();
+    } catch {}
+  }
+  __pyVersionClean = pyVer.replace(/[^0-9.]/g, '').replace(/\./g, '_');
+  return __pyVersionClean;
+}
+
 // ─── PTX arg 의미 분류 (PTX Argument Classification) ───
 function classifyPtxArg(raw, opcode) {
   let r = raw.trim();
@@ -171,6 +191,32 @@ function parseKotlinFields(body) {
         l.startsWith('fun ') || l.startsWith('class ') || l.startsWith('object ') ||
         l.startsWith('interface ')) continue;
     const m = l.match(/^(?:(?:public|private|protected|internal|open|override|const|lateinit|final)\s+|@\w+\s+)*(?:val|var)\s+([a-zA-Z0-9_]+)\s*(?::\s*([^=]+?))?\s*(?:=\s*(.+))?$/);
+    if (!m) continue;
+    fields.push({ name: m[1].trim(), type: (m[2] || '').trim(), default: (m[3] || '').trim() });
+  }
+  return fields;
+}
+
+// Kotlin 주생성자 프로퍼티 파서 (Kotlin primary-constructor property parser).
+// `class Foo(val a: Int, private val b: String = "x")` 에서 val/var 파라미터만 필드로 추출.
+// (plain 파라미터 `name: Type` 은 프로퍼티가 아니므로 제외.)
+function parseKotlinCtorFields(headerText) {
+  if (!headerText) return [];
+  const open = headerText.indexOf('(');
+  if (open < 0) return [];
+  let depth = 0, close = -1;
+  for (let i = open; i < headerText.length; i++) {
+    const c = headerText[i];
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) { close = i; break; } }
+  }
+  if (close < 0) return [];
+  const inside = headerText.substring(open + 1, close);
+  const fields = [];
+  for (const raw of splitParamsTopLevel(inside)) {
+    const p = raw.trim();
+    if (!p) continue;
+    const m = p.match(/^(?:@\w+(?:\([^)]*\))?\s*|(?:public|private|protected|internal|open|override|final|vararg)\s+)*(?:val|var)\s+([a-zA-Z0-9_]+)\s*(?::\s*([^=]+?))?\s*(?:=\s*([\s\S]+))?$/);
     if (!m) continue;
     fields.push({ name: m[1].trim(), type: (m[2] || '').trim(), default: (m[3] || '').trim() });
   }
@@ -933,15 +979,7 @@ class QuarkFolderEngine {
   }
 
   processPython(text, fileQuarkPath, relPath) {
-    let pyVer = 'unknown';
-    try {
-      pyVer = execSync('python3 --version', { encoding: 'utf8' }).trim();
-    } catch {
-      try {
-        pyVer = execSync('python --version', { encoding: 'utf8' }).trim();
-      } catch {}
-    }
-    const verClean = pyVer.replace(/[^0-9.]/g, '').replace(/\./g, '_');
+    const verClean = getPythonVersionClean();
     if (verClean) {
       mkdirSync(path.join(fileQuarkPath, `python_version__${verClean}`));
     }
@@ -1009,31 +1047,39 @@ class QuarkFolderEngine {
           cur.kind === 'record' || cur.kind === 'object') {
         const bodyOpen = body.indexOf('{');
         const bodyClose = body.lastIndexOf('}');
-        if (bodyOpen >= 0 && bodyClose > bodyOpen) {
-          const inner = body.substring(bodyOpen + 1, bodyClose);
-          let fields = [];
-          if (ext === '.java') {
-            fields = parseJavaFields(inner);
-          } else if (ext === '.kt' || ext === '.kts') {
-            fields = parseKotlinFields(inner);
-          } else if (ext === '.ts' || ext === '.js' || ext === '.tsx' || ext === '.jsx') {
-            fields = parseJSFields(inner);
-          } else {
-            fields = parseZigStructFields(inner);
-          }
-          for (const f of fields) {
-            const fDir = path.join(symQuarkPath, `field__${safeName(f.name)}`);
-            mkdirSync(fDir);
-            if (f.type) mkdirSync(path.join(fDir, `type__${safeName(f.type).substring(0, 60)}`));
-            if (f.default) mkdirSync(path.join(fDir, `default__${safeName(f.default).substring(0, 60)}`));
-            else mkdirSync(path.join(fDir, `default__missing__uninit_hazard`));
-          }
-          // RECURSE into the container body
-          if (((ext === '.kt' || ext === '.kts') && /\b(?:fun\s+[a-zA-Z0-9_]|(?:companion\s+)?object\b|(?:data\s+|enum\s+|sealed\s+|inner\s+)?class\s+[a-zA-Z_]|interface\s+[a-zA-Z_])/.test(inner)) ||
-              /(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner)) {
-            const innerLines = inner.split('\n');
-            this.processCStyle(inner, innerLines, ext, symQuarkPath, relPath);
-          }
+        const isKtContainer = (ext === '.kt' || ext === '.kts');
+        // 헤더(= `{` 이전, 또는 본문이 없으면 전체) — Kotlin 주생성자가 여기 있다.
+        const header = bodyOpen >= 0 ? body.substring(0, bodyOpen) : body;
+        const hasBody = bodyOpen >= 0 && bodyClose > bodyOpen;
+        const inner = hasBody ? body.substring(bodyOpen + 1, bodyClose) : '';
+
+        let fields = [];
+        if (ext === '.java') {
+          fields = parseJavaFields(inner);
+        } else if (isKtContainer) {
+          // 주생성자 val/var + 본문 프로퍼티 (primary-constructor props + body props)
+          fields = [...parseKotlinCtorFields(header), ...parseKotlinFields(inner)];
+        } else if (ext === '.ts' || ext === '.js' || ext === '.tsx' || ext === '.jsx') {
+          fields = parseJSFields(inner);
+        } else {
+          fields = parseZigStructFields(inner);
+        }
+        const seenField = new Set();
+        for (const f of fields) {
+          if (!f.name || seenField.has(f.name)) continue;
+          seenField.add(f.name);
+          const fDir = path.join(symQuarkPath, `field__${safeName(f.name)}`);
+          mkdirSync(fDir);
+          if (f.type) mkdirSync(path.join(fDir, `type__${safeName(f.type).substring(0, 60)}`));
+          if (f.default) mkdirSync(path.join(fDir, `default__${safeName(f.default).substring(0, 60)}`));
+          else mkdirSync(path.join(fDir, `default__missing__uninit_hazard`));
+        }
+        // RECURSE into the container body
+        if (hasBody && (
+            (isKtContainer && /\b(?:fun\s+[a-zA-Z0-9_]|(?:companion\s+)?object\b|(?:data\s+|enum\s+|sealed\s+|inner\s+)?class\s+[a-zA-Z_]|interface\s+[a-zA-Z_])/.test(inner)) ||
+            /(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner))) {
+          const innerLines = inner.split('\n');
+          this.processCStyle(inner, innerLines, ext, symQuarkPath, relPath);
         }
       } else if (cur.kind === 'fn' && (ext === '.zig' || ext === '.java' || ext === '.kt' || ext === '.kts')) {
         const open = body.indexOf('{');
@@ -2602,9 +2648,146 @@ async function runK6() {
   console.log('=============================================\n');
 }
 
+// ─── 문서 문장단위 분해/재조합 (Document sentence-level decompose / recompose) ───
+// 코드와 달리 문서는 텍스트가 곧 내용이므로 *문장 텍스트를 보존*한다(무손실).
+// AI 가 문장 단위 폴더를 원자적으로 읽고 경로로 정확히 참조 → 할루시네이션 억제.
+// 재조합은 저장된 문장을 순서대로 그대로 잇는 것이라 날조가 불가능하다.
+// (Unlike code, a document's text IS its content, so sentence text is preserved losslessly.)
+
+const SENT_PAD = (n) => String(n).padStart(4, '0');
+
+// 한국어/영어 문장 분리 (종결부호 . ! ? 。 … 기준; 한국어 '다.'/'요.' 는 . 로 커버)
+function splitSentences(text) {
+  const t = (text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return [];
+  const parts = t.match(/[^.!?。…\n]+[.!?。…]+|\S[^.!?。…\n]*$/g);
+  return parts ? parts.map((s) => s.trim()).filter(Boolean) : [t];
+}
+
+// 문서를 블록(heading / paragraph) 목록으로 파싱 (Parse a doc into heading/paragraph blocks)
+function parseDocBlocks(text) {
+  const blocks = [];
+  let cur = [];
+  const flush = () => { if (cur.length) { blocks.push({ type: 'p', text: cur.join(' ') }); cur = []; } };
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    const hm = line.trim().match(/^(#{1,6})\s+(.*)$/);
+    if (hm) {
+      flush();
+      blocks.push({ type: 'h', level: hm[1].length, text: hm[2].trim() });
+    } else if (line.trim() === '') {
+      flush();
+    } else {
+      cur.push(line.trim());
+    }
+  }
+  flush();
+  return blocks;
+}
+
+async function runDocDecompose() {
+  const file = process.argv[3];
+  if (!file) {
+    console.error('사용법: node quarkify.mjs --doc <문서파일.md|txt> [outDir]');
+    process.exit(1);
+  }
+  const resolved = path.resolve(file);
+  if (!fs.existsSync(resolved)) {
+    console.error(`❌ 에러: 문서 파일이 없습니다: ${resolved}`);
+    process.exit(1);
+  }
+  const text = fs.readFileSync(resolved, 'utf-8');
+  const baseName = path.basename(resolved);
+  const outDir = process.argv[4] ? path.resolve(process.argv[4]) : path.join(path.dirname(resolved), 'doc_quark');
+  mkdirSync(outDir);
+  const docDir = path.join(outDir, `doc__${safeName(baseName)}`);
+  if (fs.existsSync(docDir)) fs.rmSync(docDir, { recursive: true });
+  mkdirSync(docDir);
+
+  const blocks = parseDocBlocks(text);
+  let blkIdx = 0, sentTotal = 0;
+  for (const blk of blocks) {
+    if (blk.type === 'h') {
+      const bdir = path.join(docDir, `blk_${SENT_PAD(blkIdx++)}__h${blk.level}__${safeName(blk.text).substring(0, 40)}`);
+      mkdirSync(bdir);
+      fs.writeFileSync(path.join(bdir, '_text.txt'), blk.text, 'utf-8');
+    } else {
+      const bdir = path.join(docDir, `blk_${SENT_PAD(blkIdx++)}__p`);
+      mkdirSync(bdir);
+      let si = 0;
+      for (const s of splitSentences(blk.text)) {
+        const sdir = path.join(bdir, `sen_${SENT_PAD(si++)}__${safeName(s).substring(0, 40)}`);
+        mkdirSync(sdir);
+        fs.writeFileSync(path.join(sdir, '_text.txt'), s, 'utf-8');
+        sentTotal++;
+      }
+    }
+  }
+
+  console.log('=============================================');
+  console.log(' 🎉 문서 분해 완료!');
+  console.log('=============================================');
+  console.log(` 📄 문서:             ${baseName}`);
+  console.log(` 🧱 블록:             ${blkIdx} (heading/paragraph)`);
+  console.log(` ✂️  문장 폴더:       ${sentTotal}`);
+  console.log(` 📁 경로:             ${docDir}`);
+  console.log(` ↩️  재조합:          node quarkify.mjs --doc-join "${docDir}" <out.md>`);
+  console.log('=============================================\n');
+}
+
+async function runDocJoin() {
+  const target = process.argv[3];
+  if (!target) {
+    console.error('사용법: node quarkify.mjs --doc-join <doc__디렉터리> [out.md]');
+    process.exit(1);
+  }
+  let docDir = path.resolve(target);
+  if (!fs.existsSync(docDir)) {
+    console.error(`❌ 에러: 디렉터리가 없습니다: ${docDir}`);
+    process.exit(1);
+  }
+  // doc__ 디렉터리가 아니면 하위에서 찾는다 (accept parent dir too)
+  if (!path.basename(docDir).startsWith('doc__')) {
+    const sub = fs.readdirSync(docDir, { withFileTypes: true }).find((e) => e.isDirectory() && e.name.startsWith('doc__'));
+    if (sub) docDir = path.join(docDir, sub.name);
+  }
+
+  const blocks = fs.readdirSync(docDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  let out = '';
+  for (const b of blocks) {
+    const bpath = path.join(docDir, b);
+    const hm = b.match(/^blk_\d+__h(\d)/);
+    if (hm) {
+      const txt = fs.readFileSync(path.join(bpath, '_text.txt'), 'utf-8');
+      out += '#'.repeat(Number(hm[1])) + ' ' + txt + '\n\n';
+    } else {
+      const sens = fs.readdirSync(bpath, { withFileTypes: true })
+        .filter((e) => e.isDirectory()).map((e) => e.name).sort();
+      const texts = sens.map((s) => fs.readFileSync(path.join(bpath, s, '_text.txt'), 'utf-8'));
+      if (texts.length) out += texts.join(' ') + '\n\n';
+    }
+  }
+  const outFile = process.argv[4] ? path.resolve(process.argv[4]) : path.join(path.dirname(docDir), 'rejoined.md');
+  fs.writeFileSync(outFile, out.trimEnd() + '\n', 'utf-8');
+
+  console.log('=============================================');
+  console.log(' 🎉 문서 재조합 완료!');
+  console.log('=============================================');
+  console.log(` 🧱 블록:             ${blocks.length}`);
+  console.log(` 📄 출력:             ${outFile}`);
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  });
+} else if (DOC_MODE) {
+  const docFn = process.argv[2] === '--doc' ? runDocDecompose : runDocJoin;
+  docFn().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
