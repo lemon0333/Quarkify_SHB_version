@@ -46,6 +46,9 @@ const REVERSE_MODE = isMainThread && (process.argv[2] === '--collapse' || proces
 // 문서 서브커맨드(--doc / --doc-join)도 config 없이, 파일 경로만 받아 동작한다.
 // (Document subcommands also run config-less, taking a file path directly.)
 const DOC_MODE = isMainThread && (process.argv[2] === '--doc' || process.argv[2] === '--doc-join');
+// 분석 서브커맨드(--stats / --diff)도 config 없이 기존 출력 디렉터리만 받아 동작한다.
+const STATS_MODE = isMainThread && process.argv[2] === '--stats';
+const DIFF_MODE = isMainThread && process.argv[2] === '--diff';
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -56,7 +59,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE && !DOC_MODE) {
+if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -2902,12 +2905,131 @@ async function runDocJoin() {
   console.log('=============================================\n');
 }
 
+// ─── 분석: --stats (복잡도/규모 리포트), --diff (구조 변화) ───
+const DECISION_RE = /__(?:if|elif|else|for|while|switch|try|catch|except|case)\b/;
+
+function listQuarkSymbolDirs(quarkDir) {
+  // fn/method/kernel/device_fn/host_fn 심볼 폴더를 (경로, 종류) 로 수집
+  const out = [];
+  const KINDS = ['fn', 'method', 'kernel', 'device_fn', 'host_fn'];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(dir, e.name);
+      const k = e.name.split('__')[0];
+      if (KINDS.includes(k)) out.push({ name: e.name, path: full });
+      walk(full);
+    }
+  };
+  walk(quarkDir);
+  return out;
+}
+
+function countDecisions(dir) {
+  let n = 0;
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (DECISION_RE.test(e.name)) n++;
+      walk(path.join(d, e.name));
+    }
+  };
+  walk(dir);
+  return n;
+}
+
+async function runStats() {
+  const target = process.argv[3];
+  if (!target) { console.error('사용법: node quarkify.mjs --stats <outDir>'); process.exit(1); }
+  const resolved = path.resolve(target);
+  const quarkDir = fs.existsSync(path.join(resolved, 'quark')) ? path.join(resolved, 'quark') : resolved;
+  if (!fs.existsSync(quarkDir)) { console.error(`❌ quark 디렉터리가 없습니다: ${quarkDir}`); process.exit(1); }
+
+  // 메타데이터로 LOC 보강 (있으면)
+  const metaPath = path.join(resolved, 'quark_meta.json');
+  const locByQuark = {};
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      for (const s of meta.symbols || []) {
+        if (s.startLine && s.endLine) locByQuark[s.quark] = (s.endLine - s.startLine + 1);
+      }
+    } catch {}
+  }
+
+  const fns = listQuarkSymbolDirs(quarkDir).map((f) => {
+    const complexity = 1 + countDecisions(f.path);
+    const rel = path.relative(quarkDir, f.path);
+    return { name: f.name, rel, complexity, loc: locByQuark[rel] || null };
+  });
+  fns.sort((a, b) => b.complexity - a.complexity);
+
+  const totalC = fns.reduce((s, f) => s + f.complexity, 0);
+  const avgC = fns.length ? (totalC / fns.length) : 0;
+  console.log('=============================================');
+  console.log(' 📊 Quarkify 복잡도/규모 리포트');
+  console.log('=============================================');
+  console.log(` 함수/메서드:        ${fns.length}`);
+  console.log(` 평균 복잡도:        ${avgC.toFixed(1)}`);
+  console.log(` 최대 복잡도:        ${fns.length ? fns[0].complexity : 0}`);
+  console.log('\n 🔥 복잡도 상위 (리팩토링 후보):');
+  for (const f of fns.slice(0, 15)) {
+    console.log(`   C=${String(f.complexity).padStart(3)} ${f.loc ? `(${f.loc}줄) ` : ''}${f.rel}`);
+  }
+  const outFile = path.join(resolved, 'quark_stats.json');
+  fs.writeFileSync(outFile, JSON.stringify({ count: fns.length, avgComplexity: avgC, functions: fns }), 'utf-8');
+  console.log(`\n 📄 상세: ${outFile}`);
+  console.log('=============================================\n');
+}
+
+// 두 출력의 심볼 집합을 비교 (추가/삭제). 심볼 식별자는 quark 상대경로.
+function symbolSetOf(outDir) {
+  const resolved = path.resolve(outDir);
+  const metaPath = path.join(resolved, 'quark_meta.json');
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      return new Set((meta.symbols || []).map((s) => `${s.kind}:${s.quark}`));
+    } catch {}
+  }
+  // 폴백: quark 트리에서 심볼 폴더 수집
+  const quarkDir = fs.existsSync(path.join(resolved, 'quark')) ? path.join(resolved, 'quark') : resolved;
+  const set = new Set();
+  for (const f of listQuarkSymbolDirs(quarkDir)) set.add(`x:${path.relative(quarkDir, f.path)}`);
+  return set;
+}
+
+async function runDiff() {
+  const a = process.argv[3], b = process.argv[4];
+  if (!a || !b) { console.error('사용법: node quarkify.mjs --diff <oldOutDir> <newOutDir>'); process.exit(1); }
+  const setA = symbolSetOf(a), setB = symbolSetOf(b);
+  const added = [...setB].filter((s) => !setA.has(s));
+  const removed = [...setA].filter((s) => !setB.has(s));
+  console.log('=============================================');
+  console.log(' 🔀 Quarkify 구조 변화 (diff)');
+  console.log('=============================================');
+  console.log(` old 심볼: ${setA.size}  →  new 심볼: ${setB.size}`);
+  console.log(` ➕ 추가: ${added.length}   ➖ 삭제: ${removed.length}`);
+  if (added.length) { console.log('\n ➕ 추가된 심볼:'); for (const s of added.slice(0, 30)) console.log(`   + ${s.replace(/^[^:]*:/, '')}`); }
+  if (removed.length) { console.log('\n ➖ 삭제된 심볼:'); for (const s of removed.slice(0, 30)) console.log(`   - ${s.replace(/^[^:]*:/, '')}`); }
+  if (!added.length && !removed.length) console.log('\n 변화 없음 (심볼 집합 동일).');
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
+} else if (STATS_MODE) {
+  runStats().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
+} else if (DIFF_MODE) {
+  runDiff().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (DOC_MODE) {
   const docFn = process.argv[2] === '--doc' ? runDocDecompose : runDocJoin;
   docFn().catch((err) => {
