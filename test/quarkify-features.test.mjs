@@ -1,0 +1,193 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const cliPath = path.join(repoRoot, 'quarkify.mjs');
+
+async function withTempWorkspace(fn) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'quarkify-feat-'));
+  try { return await fn(dir); } finally { await rm(dir, { recursive: true, force: true }); }
+}
+
+function runCli(args) {
+  return spawnSync(process.execPath, [cliPath, ...args], { cwd: repoRoot, encoding: 'utf8' });
+}
+
+// srcFiles: { 'rel/path': 'content' }. 반환: { outDir, result }
+async function quarkifyProject(tmp, srcFiles, sourceFiles) {
+  const srcDir = path.join(tmp, 'src');
+  const outDir = path.join(tmp, 'out');
+  for (const [rel, content] of Object.entries(srcFiles)) {
+    const abs = path.join(srcDir, rel);
+    await mkdir(path.dirname(abs), { recursive: true });
+    await writeFile(abs, content, 'utf8');
+  }
+  const configPath = path.join(tmp, 'config.mjs');
+  await writeFile(configPath, `export default {
+    name: 'feat-test',
+    srcDir: ${JSON.stringify(srcDir)},
+    outDir: ${JSON.stringify(outDir)},
+    sourceFiles: ${JSON.stringify(sourceFiles)},
+    perfData: {},
+    guessRole(n){ const x=n.toLowerCase(); if(x.includes('controller'))return 'web_endpoint'; return 'general'; },
+  };\n`, 'utf8');
+  const result = runCli([configPath]);
+  return { outDir, srcDir, configPath, result };
+}
+
+function dirsOf(root) {
+  // root 하위 모든 디렉터리 상대경로 (정렬)
+  const out = [];
+  const walk = (d, base) => {
+    for (const e of require_readdir(d)) {
+      if (e.isDirectory()) { const rel = path.join(base, e.name); out.push(rel); walk(path.join(d, e.name), rel); }
+    }
+  };
+  walk(root, '');
+  return out.sort();
+}
+function require_readdir(d) { try { return readdirSync(d, { withFileTypes: true }); } catch { return []; } }
+
+test('Kotlin: class/data class/fn/주생성자 필드/어노테이션 분해', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const kt = `package x
+@RestController
+class FooController(private val svc: BarService) {
+    @GetMapping("/x")
+    fun list(): String { return svc.all() }
+}
+data class Dto(val a: Int, val b: String)
+`;
+    const { outDir, result } = await quarkifyProject(tmp, { 'Foo.kt': kt }, ['Foo.kt']);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const base = path.join(outDir, 'quark', 'file__Foo.kt');
+    assert.ok(existsSync(path.join(base, 'class__FooController')), 'class__FooController');
+    assert.ok(existsSync(path.join(base, 'class__FooController', 'fn__list')), 'fn__list');
+    assert.ok(existsSync(path.join(base, 'class__FooController', 'field__svc')), 'field__svc (주생성자)');
+    assert.ok(existsSync(path.join(base, 'class__FooController', 'annotation__RestController')), 'annotation__RestController');
+    assert.ok(existsSync(path.join(base, 'class__Dto', 'field__a')), 'data class field__a');
+    assert.ok(existsSync(path.join(base, 'class__Dto', 'field__b')), 'data class field__b');
+  });
+});
+
+test('Go/Rust: 다언어 심볼 분해', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const go = `package main
+type User struct { Name string }
+func Greet() string { return helper() }
+func helper() string { return "" }
+`;
+    const rs = `pub struct Point { pub x: i32 }
+pub enum Color { Red }
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+`;
+    const { outDir, result } = await quarkifyProject(tmp, { 'main.go': go, 'lib.rs': rs }, ['main.go', 'lib.rs']);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const goBase = path.join(outDir, 'quark', 'file__main.go');
+    assert.ok(existsSync(path.join(goBase, 'struct__User')), 'go struct__User');
+    assert.ok(existsSync(path.join(goBase, 'fn__Greet')), 'go fn__Greet');
+    const rsBase = path.join(outDir, 'quark', 'file__lib.rs');
+    assert.ok(existsSync(path.join(rsBase, 'struct__Point')), 'rust struct__Point');
+    assert.ok(existsSync(path.join(rsBase, 'enum__Color')), 'rust enum__Color');
+    assert.ok(existsSync(path.join(rsBase, 'fn__add')), 'rust fn__add');
+  });
+});
+
+test('quark_meta.json: 심볼 메타데이터 + 숫자 startLine', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const { outDir } = await quarkifyProject(tmp, { 'a.kt': 'class A {\n  fun foo() {}\n}\n' }, ['a.kt']);
+    const metaPath = path.join(outDir, 'quark_meta.json');
+    assert.ok(existsSync(metaPath), 'quark_meta.json 존재');
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    assert.ok(Array.isArray(meta.symbols) && meta.symbols.length > 0, 'symbols 비어있지 않음');
+    assert.ok(meta.symbols.some((s) => typeof s.startLine === 'number'), 'startLine 숫자 존재');
+  });
+});
+
+test('콜그래프: call__X → resolves_to__ 연결', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const go = `package main
+func Greet() string { return helper() }
+func helper() string { return "" }
+`;
+    const { outDir } = await quarkifyProject(tmp, { 'main.go': go }, ['main.go']);
+    let found = false;
+    const walk = (d) => { for (const e of require_readdir(d)) { if (e.isDirectory()) { if (e.name.startsWith('resolves_to__')) found = true; walk(path.join(d, e.name)); } } };
+    walk(path.join(outDir, 'quark'));
+    assert.ok(found, 'resolves_to__ 폴더가 하나 이상 있어야 함');
+  });
+});
+
+test('--collapse / --expand 무손실 왕복', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const { outDir } = await quarkifyProject(tmp, { 'a.kt': 'class A {\n  fun foo() {}\n}\n' }, ['a.kt']);
+    const col = runCli(['--collapse', outDir]);
+    assert.equal(col.status, 0, col.stderr);
+    const treeJson = path.join(outDir, 'quark_tree.json');
+    assert.ok(existsSync(treeJson), 'quark_tree.json 생성');
+    const restored = path.join(tmp, 'restored');
+    const exp = runCli(['--expand', treeJson, restored]);
+    assert.equal(exp.status, 0, exp.stderr);
+    const orig = dirsOf(path.join(outDir, 'quark'));
+    const back = dirsOf(path.join(restored, 'quark'));
+    assert.deepEqual(back, orig, '복원 구조가 원본 quark 트리와 동일');
+  });
+});
+
+test('--doc / --doc-join: 문장 폴더 + 텍스트 보존', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const docFile = path.join(tmp, 'doc.md');
+    await writeFile(docFile, '# 제목\n\n첫 문장이다. 둘째 문장이다.\n', 'utf8');
+    const outDir = path.join(tmp, 'docout');
+    const dec = runCli(['--doc', docFile, outDir]);
+    assert.equal(dec.status, 0, dec.stderr);
+    const docDir = path.join(outDir, 'doc__doc.md');
+    assert.ok(existsSync(docDir), 'doc__ 디렉터리 생성');
+    let textFiles = 0;
+    const walk = (d) => { for (const e of require_readdir(d)) { if (e.isDirectory()) walk(path.join(d, e.name)); else if (e.name === '_text.txt') textFiles++; } };
+    walk(docDir);
+    assert.ok(textFiles >= 3, '_text.txt(헤딩+문장) 최소 3개');
+    const rejoined = path.join(tmp, 'rejoined.md');
+    const join = runCli(['--doc-join', docDir, rejoined]);
+    assert.equal(join.status, 0, join.stderr);
+    const out = readFileSync(rejoined, 'utf8');
+    assert.ok(out.includes('첫 문장이다.') && out.includes('둘째 문장이다.'), '문장 텍스트 보존');
+  });
+});
+
+test('--k6: 소스에서 Spring 엔드포인트 추출해 스크립트 생성', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const kt = `@RestController
+@RequestMapping("/api")
+class C(private val s: S) {
+  @GetMapping("/x") fun x(): String { return "" }
+}
+`;
+    const { configPath, outDir } = await quarkifyProject(tmp, { 'C.kt': kt }, ['C.kt']);
+    const k6 = runCli(['--k6', configPath, 'http://localhost:9999']);
+    assert.equal(k6.status, 0, k6.stderr || k6.stdout);
+    const script = path.join(outDir, 'loadtest.k6.js');
+    assert.ok(existsSync(script), 'loadtest.k6.js 생성');
+    const content = readFileSync(script, 'utf8');
+    assert.ok(content.includes('/api/x'), '결합 경로 /api/x 포함');
+    assert.ok(content.includes('http.request'), 'http.request 포함');
+  });
+});
+
+test('--stats / --diff 동작', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const { outDir } = await quarkifyProject(tmp, { 'a.kt': 'class A {\n  fun foo() { if (true) {} }\n}\n' }, ['a.kt']);
+    const stats = runCli(['--stats', outDir]);
+    assert.equal(stats.status, 0, stats.stderr);
+    assert.ok(existsSync(path.join(outDir, 'quark_stats.json')), 'quark_stats.json 생성');
+    const diff = runCli(['--diff', outDir, outDir]);
+    assert.equal(diff.status, 0, diff.stderr);
+    assert.ok(/변화 없음|추가: 0/.test(diff.stdout), '자기 자신 diff = 변화 없음');
+  });
+});

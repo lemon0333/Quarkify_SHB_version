@@ -2175,6 +2175,62 @@ class QuarkFolderEngine {
     console.log(`[+] 인터랙티브 HTML 뷰어 빌드 완료: ${outPath}`);
   }
 
+  // 다차원(3D) 토폴로지 뷰어 — three.js 기반 3d-force-graph. 2D(index.html)와 별개로 추가.
+  // 깊이(z)까지 활용해 큰 그래프의 군집/계층을 입체로 탐색. 노드 색=종류, 크기=중요도.
+  writeHtmlViewer3D() {
+    const graphData = this.collectTopologyGraphData();
+    const colorByType = {
+      file: '#38bdf8', class: '#a855f7', interface: '#c084fc', struct: '#818cf8',
+      function: '#f43f5e', field: '#10b981', var: '#34d399', annotation: '#fbbf24',
+      control_stmt: '#64748b', api_call: '#f472b6', condition: '#06b6d4', catch: '#f97316',
+    };
+    const html = `<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><title>Quarkify 3D Topology - ${CONFIG.name}</title>
+<style>
+  body { margin:0; background:#05070d; color:#e2e8f0; font-family:-apple-system,sans-serif; overflow:hidden; }
+  #info { position:absolute; top:12px; left:12px; z-index:10; background:rgba(15,23,42,.7);
+          padding:12px 16px; border-radius:12px; border:1px solid rgba(255,255,255,.08); backdrop-filter:blur(8px); }
+  #info h1 { margin:0 0 4px; font-size:16px; background:linear-gradient(90deg,#818cf8,#c084fc,#f472b6);
+             -webkit-background-clip:text; background-clip:text; color:transparent; }
+  #info .muted { color:#64748b; font-size:11px; }
+  #legend { position:absolute; bottom:12px; left:12px; z-index:10; background:rgba(15,23,42,.7);
+            padding:10px 14px; border-radius:12px; font-size:11px; max-width:200px; }
+  #legend span { display:inline-block; margin:2px 6px 2px 0; }
+  #legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:4px; vertical-align:middle; }
+</style>
+<script src="https://unpkg.com/3d-force-graph"></script></head>
+<body>
+<div id="info"><h1>Quarkify 3D ⚛️</h1><div>${CONFIG.name}</div>
+  <div class="muted">노드 ${graphData.nodes.length} · 링크 ${graphData.links.length} · 드래그=회전 / 스크롤=줌</div></div>
+<div id="legend"></div>
+<div id="graph"></div>
+<script>
+  const data = ${JSON.stringify(graphData)};
+  const COLORS = ${JSON.stringify(colorByType)};
+  const legend = document.getElementById('legend');
+  legend.innerHTML = Object.entries(COLORS).map(([k,c]) => '<span><i style="background:'+c+'"></i>'+k+'</span>').join('');
+  const Graph = ForceGraph3D()(document.getElementById('graph'))
+    .graphData(data)
+    .backgroundColor('#05070d')
+    .nodeLabel(n => n.label + ' ('+n.type+')')
+    .nodeColor(n => COLORS[n.type] || '#94a3b8')
+    .nodeVal(n => n.val || 1)
+    .nodeOpacity(0.9)
+    .linkColor(() => 'rgba(255,255,255,0.12)')
+    .linkWidth(0.4)
+    .linkDirectionalParticles(1)
+    .linkDirectionalParticleWidth(0.8)
+    .onNodeClick(node => {
+      const dist = 80;
+      const ratio = 1 + dist/Math.hypot(node.x||1, node.y||1, node.z||1);
+      Graph.cameraPosition({ x:(node.x||0)*ratio, y:(node.y||0)*ratio, z:(node.z||0)*ratio }, node, 1500);
+    });
+</script></body></html>`;
+    const outPath = path.join(this.outputDir, 'index_3d.html');
+    fs.writeFileSync(outPath, html, 'utf-8');
+    console.log(`[+] 3D 토폴로지 뷰어 빌드 완료: ${outPath}`);
+  }
+
   writeAiContextGuide() {
     const text = `================================================================================
 🤖 AI 코딩 에이전트(LLM) 전용 위상 지도 네비게이션 가이드 (AI Context Guide)
@@ -2412,6 +2468,7 @@ async function main() {
 
   // 시각화 뷰어 및 AI 가이드 자동 생성 (Automatically generate visualization viewer and AI guide)
   engine.writeHtmlViewer();
+  engine.writeHtmlViewer3D();
   engine.writeAiContextGuide();
 
   const s = engine.getStats();
