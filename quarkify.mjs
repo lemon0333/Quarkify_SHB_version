@@ -1054,7 +1054,7 @@ class QuarkFolderEngine {
 
       if (cur.kind === 'struct' || cur.kind === 'union' || cur.kind === 'enum' ||
           cur.kind === 'class' || cur.kind === 'namespace' || cur.kind === 'interface' ||
-          cur.kind === 'record' || cur.kind === 'object') {
+          cur.kind === 'record' || cur.kind === 'object' || cur.kind === 'impl') {
         const bodyOpen = body.indexOf('{');
         const bodyClose = body.lastIndexOf('}');
         const isKtContainer = (ext === '.kt' || ext === '.kts');
@@ -1086,6 +1086,7 @@ class QuarkFolderEngine {
         }
         // RECURSE into the container body
         if (hasBody && (
+            ((ext === '.go' || ext === '.rs' || ext === '.swift' || ext === '.cs') && /\b(?:fn|func)\s+[A-Za-z_]|\b(?:struct|enum|interface|trait|impl|class|protocol|extension)\s+[A-Za-z_]|[A-Za-z_][\w<>\[\],.?]*\s+[A-Za-z_]\w*\s*\(/.test(inner)) ||
             (isKtContainer && /\b(?:fun\s+[a-zA-Z0-9_]|(?:companion\s+)?object\b|(?:data\s+|enum\s+|sealed\s+|inner\s+)?class\s+[a-zA-Z_]|interface\s+[a-zA-Z_])/.test(inner)) ||
             /(?:^|\n)\s*(?:pub\s+)?(?:noinline\s+|inline\s+)?fn\s+[a-zA-Z0-9_]+\s*\(|(?:^|\n)\s*(?:pub\s+)?const\s+[a-zA-Z0-9_]+\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union|enum)|(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+[a-zA-Z_]|\b(?:class|interface|enum|record)\s+[a-zA-Z0-9_]+|\b[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*\([^;]*\{|\b(?:function)\b|=>/.test(inner))) {
           const innerLines = inner.split('\n');
@@ -1134,6 +1135,9 @@ class QuarkFolderEngine {
     //  - 바디 `{`가 없으면(표현식 바디 `=`, data class 한 줄, 추상 fun, val/var) 해당 줄에서 종료
     //    단, 바로 다음 비어있지 않은 줄이 `{`로 시작하면 블록 바디가 따라오는 것이므로 대기
     const isKt = (ext === '.kt' || ext === '.kts');
+    // 선택적 중괄호 언어(주생성자/표현식바디/유닛구조체 등) — Kotlin 식 유연 종료 판정을 공유.
+    // (Languages with optional-brace decls share Kotlin's flexible completion logic.)
+    const isFlex = isKt || ext === '.rs' || ext === '.swift' || ext === '.go' || ext === '.cs';
     const tryFinishKotlin = (i, openers, closers, oparens, cparens) => {
       parenDepth += oparens - cparens;
       depth += openers - closers;
@@ -1239,13 +1243,57 @@ class QuarkFolderEngine {
           } else if ((m = line.match(new RegExp(`^\\s*${KMOD}(?:val|var)\\s+([a-zA-Z0-9_]+)\\s*[:=]`)))) {
             name = m[1]; kind = 'var'; role = 'state';
           }
+        } else if (ext === '.go') {
+          const t = line.trim();
+          if (t.startsWith('//') || t.startsWith('*') || t === '' || t.startsWith('package ') || t.startsWith('import ')) {
+          } else if ((m = line.match(/^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(/))) {
+            name = m[1]; kind = 'fn'; role = guessRole(name);
+          } else if ((m = line.match(/^\s*type\s+([A-Za-z_]\w*)\s+struct\b/))) {
+            name = m[1]; kind = 'struct'; role = 'type';
+          } else if ((m = line.match(/^\s*type\s+([A-Za-z_]\w*)\s+interface\b/))) {
+            name = m[1]; kind = 'interface'; role = 'type';
+          }
+        } else if (ext === '.rs') {
+          const t = line.trim();
+          const RMOD = '(?:(?:pub(?:\\([^)]*\\))?|async|unsafe|const|extern(?:\\s+"[^"]*")?|default)\\s+)*';
+          if (t.startsWith('//') || t.startsWith('*') || t === '' || t.startsWith('use ') || t.startsWith('#')) {
+          } else if ((m = line.match(new RegExp(`^\\s*${RMOD}fn\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[1]; kind = 'fn'; role = guessRole(name);
+          } else if ((m = line.match(new RegExp(`^\\s*${RMOD}struct\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[1]; kind = 'struct'; role = 'type';
+          } else if ((m = line.match(new RegExp(`^\\s*${RMOD}enum\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[1]; kind = 'enum'; role = 'type';
+          } else if ((m = line.match(new RegExp(`^\\s*${RMOD}trait\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[1]; kind = 'interface'; role = 'type';
+          } else if ((m = line.match(/^\s*impl(?:\s*<[^>]*>)?\s+(?:[A-Za-z_][\w:<>, ]*\s+for\s+)?([A-Za-z_]\w*)/))) {
+            name = m[1]; kind = 'impl'; role = 'type';
+          }
+        } else if (ext === '.swift') {
+          const t = line.trim();
+          const SMOD = '(?:(?:public|private|internal|fileprivate|open|final|static|class|override|mutating|convenience|required|@\\w+)\\s+)*';
+          if (t.startsWith('//') || t.startsWith('*') || t === '' || t.startsWith('import ')) {
+          } else if ((m = line.match(new RegExp(`^\\s*${SMOD}func\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[1]; kind = 'fn'; role = guessRole(name);
+          } else if ((m = line.match(/^\s*(?:public\s+|private\s+|internal\s+|fileprivate\s+|open\s+|final\s+)*(class|struct|enum|protocol|extension)\s+([A-Za-z_]\w*)/))) {
+            name = m[2]; kind = (m[1] === 'protocol' ? 'interface' : m[1] === 'extension' ? 'impl' : m[1]); role = 'type';
+          }
+        } else if (ext === '.cs') {
+          const t = line.trim();
+          const CSMOD = '(?:(?:public|private|protected|internal|static|sealed|abstract|partial|virtual|override|async|readonly|unsafe|new)\\s+)*';
+          if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') || t === '' || t.startsWith('using ') || t.startsWith('namespace ') || t.startsWith('[')) {
+          } else if ((m = line.match(new RegExp(`^\\s*${CSMOD}(class|interface|struct|enum|record)\\s+([A-Za-z_]\\w*)`)))) {
+            name = m[2]; kind = (m[1] === 'record' ? 'class' : m[1]);
+            const r = guessRole(name); role = (r && r !== 'general') ? r : 'type';
+          } else if ((m = line.match(new RegExp(`^\\s*${CSMOD}[A-Za-z_][\\w<>\\[\\],.?]*\\s+([A-Za-z_]\\w*)\\s*\\(`))) && !line.match(/\b(?:if|while|for|foreach|switch|return|using|lock)\b/)) {
+            name = m[1]; kind = 'method'; role = guessRole(name);
+          }
         }
         if (name) {
           cur = { name, kind, role };
           cur.annotations = pendingAnnotations;
           pendingAnnotations = [];
           symStart = i;
-          if (isKt) {
+          if (isFlex) {
             depth = 0; openedOnce = false; parenDepth = 0;
             tryFinishKotlin(i, openers, closers, oparens, cparens);
           } else {
@@ -1255,7 +1303,7 @@ class QuarkFolderEngine {
             else if (openedOnce && depth <= 0) finishSymbol(i + 1);
           }
         }
-      } else if (isKt) {
+      } else if (isFlex) {
         tryFinishKotlin(i, openers, closers, oparens, cparens);
       } else {
         depth += openers - closers;
