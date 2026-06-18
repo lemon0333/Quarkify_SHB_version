@@ -180,6 +180,24 @@ class C(private val s: S) {
   });
 });
 
+test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const kt = `class AuthService {
+  fun refreshToken(): String { return "" }
+  fun unrelatedThing(): Int { return 0 }
+}
+`;
+    const { outDir } = await quarkifyProject(tmp, { 'A.kt': kt }, ['A.kt']);
+    const solve = runCli(['--solve', outDir, 'refresh token 인증']);
+    assert.equal(solve.status, 0, solve.stderr || solve.stdout);
+    const pack = path.join(outDir, 'solve_pack.md');
+    assert.ok(existsSync(pack), 'solve_pack.md 생성');
+    const content = readFileSync(pack, 'utf8');
+    assert.ok(content.includes('refreshToken'), '관련 심볼 refreshToken 포함');
+    assert.ok(existsSync(path.join(outDir, 'solve_pack.json')), 'solve_pack.json 생성');
+  });
+});
+
 test('--stats / --diff 동작', async () => {
   await withTempWorkspace(async (tmp) => {
     const { outDir } = await quarkifyProject(tmp, { 'a.kt': 'class A {\n  fun foo() { if (true) {} }\n}\n' }, ['a.kt']);

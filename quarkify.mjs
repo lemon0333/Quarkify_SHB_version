@@ -49,6 +49,8 @@ const DOC_MODE = isMainThread && (process.argv[2] === '--doc' || process.argv[2]
 // 분석 서브커맨드(--stats / --diff)도 config 없이 기존 출력 디렉터리만 받아 동작한다.
 const STATS_MODE = isMainThread && process.argv[2] === '--stats';
 const DIFF_MODE = isMainThread && process.argv[2] === '--diff';
+// OSS 난제 해결 도구: 기존 출력 + 이슈 키워드로 "해결 컨텍스트 팩" 생성 (config 불필요).
+const SOLVE_MODE = isMainThread && process.argv[2] === '--solve';
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -59,7 +61,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE) {
+if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -3125,12 +3127,140 @@ async function runDiff() {
   console.log('=============================================\n');
 }
 
+// ─── OSS 난제 해결 도구 (--solve): 이슈 키워드 → 해결 컨텍스트 팩 ───
+// 풀 자동수정은 외부 LLM 에이전트의 몫. 여기서는 그 "엔진" — 어디를 고쳐야 하는지(정확한 file:line)
+// 와 영향 범위(호출자/피호출자)를 Quarkify 메타+콜그래프로 그라운딩해 최소 토큰 팩으로 만든다.
+
+const STOPWORDS = new Set(['the', 'a', 'an', 'is', 'to', 'of', 'in', 'on', 'and', 'or', 'for', 'with',
+  'error', 'issue', 'bug', 'fix', 'when', 'after', 'this', 'that', '버그', '에러', '문제', '오류', '하면', '에서', '관련']);
+
+function tokenizeQuery(q) {
+  const raw = (q || '').toLowerCase().split(/[^a-z0-9가-힣]+/).filter(Boolean);
+  return [...new Set(raw.filter((t) => t.length >= 2 && !STOPWORDS.has(t)))];
+}
+
+// 심볼명을 단어로 분해 (camelCase / snake_case / Class__method)
+function symbolWords(s) {
+  return (s || '').replace(/__/g, ' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_.]/g, ' ').toLowerCase();
+}
+
+// resolves_to__ 역인덱스: 타겟토큰 → [호출자 심볼 quark]  (token = safeName(정의 quark).slice(0,90))
+function buildCallerIndex(quarkDir) {
+  const idx = Object.create(null);
+  const KINDS = ['fn', 'method', 'kernel', 'device_fn', 'host_fn'];
+  const walk = (dir, ownerRel) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const rel = path.relative(quarkDir, path.join(dir, e.name));
+      const kind = e.name.split('__')[0];
+      const owner = KINDS.includes(kind) ? rel : ownerRel;
+      if (e.name.startsWith('resolves_to__') && ownerRel) {
+        const token = e.name.slice('resolves_to__'.length);
+        (idx[token] || (idx[token] = new Set())).add(ownerRel);
+      }
+      walk(path.join(dir, e.name), owner);
+    }
+  };
+  walk(quarkDir, null);
+  return idx;
+}
+
+async function runSolve() {
+  const target = process.argv[3];
+  const query = process.argv.slice(4).join(' ').trim();
+  if (!target || !query) {
+    console.error('사용법: node quarkify.mjs --solve <outDir> "<이슈 설명/키워드>"');
+    process.exit(1);
+  }
+  const resolved = path.resolve(target);
+  const metaPath = path.join(resolved, 'quark_meta.json');
+  if (!fs.existsSync(metaPath)) {
+    console.error(`❌ quark_meta.json 이 없습니다. 먼저 해당 레포를 quarkify 하세요: ${metaPath}`);
+    process.exit(1);
+  }
+  const quarkDir = path.join(resolved, 'quark');
+  const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  const tokens = tokenizeQuery(query);
+  if (!tokens.length) { console.error('❌ 유효한 키워드가 없습니다.'); process.exit(1); }
+
+  // 관련도 점수: 이름(가중3) + 시그니처(2) + 파일경로(1) 에서 토큰 매칭
+  const scored = [];
+  for (const s of meta.symbols || []) {
+    const nameW = symbolWords(s.name);
+    const sigW = (s.signature || '').toLowerCase();
+    const fileW = (s.file || '').toLowerCase();
+    let score = 0;
+    for (const t of tokens) {
+      if (nameW.includes(t)) score += 3;
+      if (sigW.includes(t)) score += 2;
+      if (fileW.includes(t)) score += 1;
+    }
+    if (score > 0) scored.push({ ...s, score });
+  }
+  scored.sort((a, b) => b.score - a.score || (a.endLine - a.startLine) - (b.endLine - b.startLine));
+  const top = scored.slice(0, 12);
+
+  const callerIdx = fs.existsSync(quarkDir) ? buildCallerIndex(quarkDir) : {};
+  const calleesOf = (quarkRel) => {
+    const dir = path.join(quarkDir, quarkRel);
+    const out = new Set();
+    const walk = (d) => {
+      let entries; try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        if (e.name.startsWith('call__')) out.add(e.name.slice('call__'.length));
+        else walk(path.join(d, e.name));
+      }
+    };
+    walk(dir);
+    return [...out];
+  };
+
+  // 컨텍스트 팩 작성
+  let md = `# 🩺 Quarkify Solve Pack\n\n**이슈:** ${query}\n\n**키워드:** ${tokens.join(', ')}\n\n`;
+  md += `상위 ${top.length}개 후보 (관련도 순). 각 항목의 file:line 만 열어 최소 토큰으로 수정하세요.\n\n`;
+  if (!top.length) md += '_관련 심볼을 찾지 못했습니다. 키워드를 바꿔보세요._\n';
+  const fileSet = new Set();
+  for (const s of top) {
+    fileSet.add(s.file);
+    const callees = calleesOf(s.quark);
+    const token = safeName(s.quark).substring(0, 90);
+    const callers = callerIdx[token] ? [...callerIdx[token]] : [];
+    md += `## ${s.name}  ·  점수 ${s.score}\n`;
+    md += `- 위치: \`${s.file}:${s.startLine || '?'}${s.endLine ? '-' + s.endLine : ''}\`\n`;
+    md += `- 종류/역할: ${s.kind} / ${s.role}\n`;
+    if (s.signature) md += `- 시그니처: \`${s.signature}\`\n`;
+    md += `- 영향(호출자 ${callers.length}): ${callers.slice(0, 6).map((c) => '`' + c.split('/').pop() + '`').join(', ') || '없음/미상'}\n`;
+    md += `- 호출(피호출 ${callees.length}): ${callees.slice(0, 10).map((c) => '`' + c + '`').join(', ') || '없음'}\n\n`;
+  }
+  md += `## 📂 읽어볼 파일 (집중)\n${[...fileSet].map((f) => `- ${f}`).join('\n')}\n\n`;
+  md += `## ▶️ 다음 단계 (외부 LLM 에이전트)\n1. 위 file:line 만 컨텍스트로 로드(전체 파일 X)\n2. 호출자 목록으로 변경 영향 검토\n3. 수정 후 \`--diff\` 로 구조 변화 확인, 테스트 실행\n`;
+
+  const outFile = path.join(resolved, 'solve_pack.md');
+  fs.writeFileSync(outFile, md, 'utf-8');
+  const jsonFile = path.join(resolved, 'solve_pack.json');
+  fs.writeFileSync(jsonFile, JSON.stringify({ query, tokens, candidates: top }), 'utf-8');
+
+  console.log('=============================================');
+  console.log(' 🩺 Solve Pack 생성 완료!');
+  console.log('=============================================');
+  console.log(` 🔑 키워드:           ${tokens.join(', ')}`);
+  console.log(` 🎯 후보 심볼:        ${top.length} / 매칭 ${scored.length}`);
+  for (const s of top.slice(0, 8)) console.log(`   [${s.score}] ${s.name}  ${s.file}:${s.startLine || '?'}`);
+  console.log(` 📄 팩:               ${outFile}`);
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
+} else if (SOLVE_MODE) {
+  runSolve().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (STATS_MODE) {
   runStats().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (DIFF_MODE) {
