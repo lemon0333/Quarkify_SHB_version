@@ -1057,7 +1057,9 @@ class QuarkFolderEngine {
       const name = idM ? idM[1] : (clM ? clM[1].split(/\s+/)[0] : tag);
       const kind = /^h[1-6]$/.test(tag) ? 'heading' : (tag === 'section' || tag === 'article' || tag === 'form') ? 'section' : 'element';
       const parent = stack[stack.length - 1].path;
-      const full = path.join(parent, `${tag}__${safeName(name)}`);
+      // id/class 가 있으면 tag__name, 없으면(이름=태그) 그냥 tag 로 — body/head 가 body__body 되지 않게
+      const folderName = (name === tag) ? tag : `${tag}__${safeName(name)}`;
+      const full = path.join(parent, folderName);
       mkdirSync(full);
       if (idM) mkdirSync(path.join(full, `id__${safeName(idM[1])}`));
       if (clM) mkdirSync(path.join(full, `class__${safeName(clM[1].split(/\s+/)[0])}`));
