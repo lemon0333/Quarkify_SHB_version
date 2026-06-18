@@ -225,6 +225,23 @@ test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async
   });
 });
 
+test('--dead: 호출자 없는 심볼을 데드코드 후보로', async () => {
+  await withTempWorkspace(async (tmp) => {
+    // Greet 는 아무도 호출 안 함(데드 후보), helper 는 Greet 가 호출함(데드 아님)
+    const go = `package main
+func Greet() string { return helper() }
+func helper() string { return "" }
+`;
+    const { outDir } = await quarkifyProject(tmp, { 'main.go': go }, ['main.go']);
+    const dead = runCli(['--dead', outDir]);
+    assert.equal(dead.status, 0, dead.stderr || dead.stdout);
+    const pack = JSON.parse(readFileSync(path.join(outDir, 'dead_code.json'), 'utf8'));
+    const names = pack.candidates.map((c) => c.name);
+    assert.ok(names.includes('Greet'), 'Greet(미호출)는 데드 후보');
+    assert.ok(!names.includes('helper'), 'helper(호출됨)는 데드 아님');
+  });
+});
+
 test('--stats / --diff 동작', async () => {
   await withTempWorkspace(async (tmp) => {
     const { outDir } = await quarkifyProject(tmp, { 'a.kt': 'class A {\n  fun foo() { if (true) {} }\n}\n' }, ['a.kt']);

@@ -52,6 +52,8 @@ const STATS_MODE = isMainThread && process.argv[2] === '--stats';
 const DIFF_MODE = isMainThread && process.argv[2] === '--diff';
 // OSS 난제 해결 도구: 기존 출력 + 이슈 키워드로 "해결 컨텍스트 팩" 생성 (config 불필요).
 const SOLVE_MODE = isMainThread && process.argv[2] === '--solve';
+// 데드코드 감지: 콜그래프에서 들어오는 엣지(호출자)가 없는 심볼 = 끊긴 선 = 데드코드 후보.
+const DEAD_MODE = isMainThread && process.argv[2] === '--dead';
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -62,7 +64,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE) {
+if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE && !DEAD_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -2333,20 +2335,37 @@ function splitParamsTopLevel(text) {
 }
 
 // ─── Glob 파일 검색 및 매칭 헬퍼 (Glob File Search & Match Helpers) ───
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'build', 'dist', '.venv', 'venv',
+  'target', '.next', '.gradle', '__pycache__', '.idea', '.quarkify-output', 'quark', '_mirror', '_axon']);
+
 function getFilesRecursively(dir, files = []) {
   if (!fs.existsSync(dir)) return files;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const res = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name !== '.git' && entry.name !== 'node_modules') {
-        getFilesRecursively(res, files);
-      }
+      if (!SKIP_DIRS.has(entry.name)) getFilesRecursively(res, files);
     } else {
       files.push(res);
     }
   }
   return files;
+}
+
+// Quarkify 가 분해할 수 있는 소스 확장자 (auto 모드/폴백에서 사용)
+const SUPPORTED_EXTS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.py', '.kt', '.kts', '.java',
+  '.go', '.rs', '.swift', '.cs', '.zig', '.cu', '.cuh',
+  '.cpp', '.cc', '.cxx', '.h', '.hpp', '.metal', '.m', '.mm', '.ptx',
+]);
+
+// srcDir 전체를 훑어 지원 확장자 파일만 상대경로로 반환 (언어 자동 감지)
+function autoScanSourceFiles() {
+  const out = [];
+  for (const abs of getFilesRecursively(CONFIG.srcDir)) {
+    if (SUPPORTED_EXTS.has(path.extname(abs))) out.push(path.relative(CONFIG.srcDir, abs));
+  }
+  return out;
 }
 
 function matchGlobPattern(relPath, pattern) {
@@ -2423,14 +2442,29 @@ function validateOutputDir(outDir, srcDir) {
 // CONFIG.sourceFiles 를 실제 상대경로 목록으로 해석 (글로브 지원). main 과 --k6 가 공유.
 // (Resolve CONFIG.sourceFiles to a list of relative paths, supporting globs. Shared by main and --k6.)
 function resolveSourceFiles({ verbose = false } = {}) {
-  const hasGlob = CONFIG.sourceFiles.some(f => f.includes('*'));
-  if (!hasGlob) return CONFIG.sourceFiles;
+  const list = CONFIG.sourceFiles || [];
+  // auto 모드: sourceFiles 가 비었거나 'auto'/'**' 를 포함하면 언어 자동 감지.
+  const wantsAuto = list.length === 0 || list.some(f => f === 'auto' || f === '**' || f === '**/*');
+  if (wantsAuto) {
+    const scanned = autoScanSourceFiles();
+    if (verbose) console.log(`🔍 auto 모드: 지원 확장자 ${scanned.length}개 파일 자동 감지.\n`);
+    return scanned;
+  }
+  const hasGlob = list.some(f => f.includes('*'));
+  if (!hasGlob) return list;
   if (verbose) console.log('🔍 Glob 패턴 감지됨. 소스 디렉터리 스캔 중...');
   const resolved = [];
-  const allFiles = getFilesRecursively(CONFIG.srcDir);
-  for (const fileAbs of allFiles) {
+  for (const fileAbs of getFilesRecursively(CONFIG.srcDir)) {
     const fileRel = path.relative(CONFIG.srcDir, fileAbs);
-    if (CONFIG.sourceFiles.some(pat => matchGlobPattern(fileRel, pat))) resolved.push(fileRel);
+    if (list.some(pat => matchGlobPattern(fileRel, pat))) resolved.push(fileRel);
+  }
+  // 무매칭 폴백: 글로브가 하나도 안 맞으면 죽지 말고 자동 감지로 폴백 (소비자 글로브가 틀려도 동작).
+  if (resolved.length === 0) {
+    const scanned = autoScanSourceFiles();
+    if (scanned.length) {
+      console.warn(`⚠️  지정한 glob 에 매칭된 파일이 없어 auto 감지로 폴백합니다 (${scanned.length}개).`);
+      return scanned;
+    }
   }
   if (verbose) console.log(`[+] 스캔 완료: 총 ${resolved.length}개 파일 매칭됨.\n`);
   return resolved;
@@ -3326,12 +3360,73 @@ async function runSolve() {
   console.log('=============================================\n');
 }
 
+// ─── 데드코드 감지 (--dead): 호출자가 없는(끊긴 선) 심볼 후보 ───
+// ⚠️ 휴리스틱: 동적 디스패치/프레임워크 호출(@Bean, 이벤트 핸들러, 라이브러리 export, 오버라이드)은
+//    호출자가 코드상 안 보여 오탐될 수 있다. 진입점(web_endpoint)·main/init 류는 제외한다.
+const ENTRY_NAME_RE = /^(main|init|__init__|__main__|setup|configure|register|bootstrap|run|handle|start|index|App)$/i;
+
+async function runDead() {
+  const target = process.argv[3];
+  if (!target) { console.error('사용법: node quarkify.mjs --dead <outDir>'); process.exit(1); }
+  const resolved = path.resolve(target);
+  const metaPath = path.join(resolved, 'quark_meta.json');
+  if (!fs.existsSync(metaPath)) {
+    console.error(`❌ quark_meta.json 이 없습니다. 먼저 quarkify 하세요: ${metaPath}`);
+    process.exit(1);
+  }
+  const quarkDir = path.join(resolved, 'quark');
+  const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  const callerIdx = fs.existsSync(quarkDir) ? buildCallerIndex(quarkDir) : {};
+  const CALLABLE = new Set(['fn', 'method', 'kernel', 'device_fn', 'host_fn']);
+
+  // 심볼 quark 폴더에 annotation__ 자식이 있으면 프레임워크가 호출(@GetMapping/@Bean/@ExceptionHandler 등) → 데드 아님
+  const isAnnotated = (quarkRel) => {
+    const dir = path.join(quarkDir, quarkRel);
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true })
+        .some((e) => e.isDirectory() && e.name.startsWith('annotation__'));
+    } catch { return false; }
+  };
+
+  const dead = [];
+  let callableTotal = 0, annotatedSkipped = 0;
+  for (const s of meta.symbols || []) {
+    if (!CALLABLE.has(s.kind)) continue;
+    callableTotal++;
+    if (s.role === 'web_endpoint') continue;        // HTTP 진입점은 외부에서 호출됨
+    if (ENTRY_NAME_RE.test(s.name)) continue;        // main/init 류 진입점
+    if (isAnnotated(s.quark)) { annotatedSkipped++; continue; } // 프레임워크 호출
+    const token = safeName(s.quark).substring(0, 90);
+    const callers = callerIdx[token];
+    if (!callers || callers.size === 0) dead.push(s);
+  }
+  dead.sort((a, b) => (b.endLine - b.startLine) - (a.endLine - a.startLine));
+
+  console.log('=============================================');
+  console.log(' 🪦 데드코드 후보 (호출자 없음 = 끊긴 선)');
+  console.log('=============================================');
+  console.log(` 함수/메서드 총 ${callableTotal} · 어노테이션(프레임워크) 제외 ${annotatedSkipped} · 데드 후보 ${dead.length}`);
+  console.log(' ⚠️ 휴리스틱 — 동적 호출/라이브러리 export/인터페이스 구현은 오탐 가능. 삭제 전 확인.');
+  for (const s of dead.slice(0, 25)) {
+    const loc = `${s.file}:${s.startLine || '?'}`;
+    const lines = (s.endLine && s.startLine) ? `${s.endLine - s.startLine + 1}줄` : '';
+    console.log(`   ✂️ ${s.name}  ${loc} ${lines}`);
+  }
+  if (dead.length > 25) console.log(`   ... 외 ${dead.length - 25}개`);
+  const outFile = path.join(resolved, 'dead_code.json');
+  fs.writeFileSync(outFile, JSON.stringify({ callableTotal, count: dead.length, candidates: dead }), 'utf-8');
+  console.log(` 📄 ${outFile}`);
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
+} else if (DEAD_MODE) {
+  runDead().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (SOLVE_MODE) {
   runSolve().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (STATS_MODE) {
