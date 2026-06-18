@@ -2712,16 +2712,54 @@ function extractSpringEndpoints(text) {
   while ((m = re.exec(text)) !== null) {
     const method = SPRING_METHOD[`${m[1]}Mapping`];
     const sub = annPathArg(m[2] || '');
-    endpoints.push({ method, path: joinPath(basePath, sub) });
+    endpoints.push({ method, path: joinPath(basePath, sub), bodyType: springBodyType(text, m.index) });
   }
   // @RequestMapping(method = RequestMethod.GET, value="/x") 형태의 메서드 매핑
   const rm = /@RequestMapping\s*\(([^)]*method\s*=\s*RequestMethod\.[^)]*)\)/g;
   while ((m = rm.exec(text)) !== null) {
     const methodM = m[1].match(/RequestMethod\.(\w+)/);
     if (!methodM) continue;
-    endpoints.push({ method: methodM[1].toUpperCase(), path: joinPath(basePath, annPathArg(m[1])) });
+    endpoints.push({ method: methodM[1].toUpperCase(), path: joinPath(basePath, annPathArg(m[1])), bodyType: springBodyType(text, m.index) });
   }
   return endpoints;
+}
+
+// 메서드 시그니처에서 @RequestBody 의 타입명 추출 (Kotlin `name: Type` / Java `Type name`).
+function springBodyType(text, fromIdx) {
+  const braceIdx = text.indexOf('{', fromIdx);
+  const win = text.substring(fromIdx, braceIdx < 0 ? fromIdx + 500 : braceIdx);
+  const rb = win.match(/@RequestBody\b[^,)]*?(?::\s*([A-Za-z_]\w*)|\b([A-Z][A-Za-z0-9_]*)\s+\w+)/);
+  return rb ? (rb[1] || rb[2]) : null;
+}
+
+// 타입명 → 샘플 값 (요청 바디 자동 생성용)
+function sampleForType(t) {
+  const x = (t || '').replace(/[?<].*$/, '').toLowerCase();
+  if (/(int|long|short|byte|double|float|number|decimal|integer)/.test(x)) return 1;
+  if (/bool/.test(x)) return true;
+  if (/(list|set|collection|array|iterable|seq)/.test(x)) return [];
+  if (/map|object/.test(x)) return {};
+  return 'sample';
+}
+
+// 소스에서 DTO(생성자 파라미터 기반: Kotlin data class / class, Java record) → {타입: {필드: 샘플}}
+function extractDtos(text) {
+  const dtos = {};
+  const re = /\b(?:data\s+class|class|record)\s+([A-Z]\w*)\s*\(([^)]*)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const fields = {};
+    for (const raw of splitParamsTopLevel(m[2])) {
+      const p = raw.trim();
+      if (!p) continue;
+      let fm = p.match(/(?:val|var)\s+(\w+)\s*:\s*([A-Za-z_][\w<>.]*)/); // Kotlin
+      if (fm) { fields[fm[1]] = sampleForType(fm[2]); continue; }
+      const jm = p.match(/^(?:@\w+\s+)*([A-Za-z_][\w<>.]*)\s+(\w+)$/); // Java record: Type name
+      if (jm) fields[jm[2]] = sampleForType(jm[1]);
+    }
+    if (Object.keys(fields).length) dtos[m[1]] = fields;
+  }
+  return dtos;
 }
 
 // FastAPI / Flask 스타일 — @router.get("/x") / @app.post("/x") (prefix 는 추정 불가하므로 무시)
@@ -2741,17 +2779,24 @@ function extractEndpoints(text, ext) {
   return [];
 }
 
-function generateK6Script(endpoints, baseUrl, name) {
-  const eps = endpoints.map((e) => ({
-    method: e.method,
-    // 경로 파라미터({id}, :id)는 샘플값 '1' 로 치환 (substitute path params with sample '1')
-    path: (e.path.replace(/\{[^}]+\}/g, '1').replace(/:[a-zA-Z_]\w*/g, '1')) || '/',
-  }));
-  return `import http from 'k6/http';
+function generateK6Script(endpoints, baseUrl, name, dtoRegistry = {}) {
+  let bodyHits = 0;
+  const eps = endpoints.map((e) => {
+    const p = (e.path.replace(/\{[^}]+\}/g, '1').replace(/:[a-zA-Z_]\w*/g, '1')) || '/';
+    const hasBody = e.method === 'POST' || e.method === 'PUT' || e.method === 'PATCH';
+    let body = null;
+    if (hasBody) {
+      if (e.bodyType && dtoRegistry[e.bodyType]) { body = JSON.stringify(dtoRegistry[e.bodyType]); bodyHits++; }
+      else body = '{}';
+    }
+    return { method: e.method, path: p, body };
+  });
+  return { bodyHits, script: `import http from 'k6/http';
 import { check, sleep } from 'k6';
 
 // ⚛️ Quarkify auto-generated k6 load test — ${name}
-// ⚠️ 경로 파라미터({id} 등)는 샘플값 '1'로 치환됨. POST/PUT/PATCH 바디는 빈 객체이니 실제 값으로 조정하세요.
+// ⚠️ 경로 파라미터({id} 등)는 샘플값 '1'로 치환됨. POST/PUT/PATCH 바디는 파싱한 DTO 필드로 자동 생성(없으면 {}).
+//    샘플 값은 타입별 기본값이니 실제 검증 값으로 조정하세요.
 // 실행: k6 run loadtest.k6.js   |   BASE_URL=https://api.example.com VUS=50 DURATION=1m k6 run loadtest.k6.js
 
 export const options = {
@@ -2770,14 +2815,13 @@ const endpoints = ${JSON.stringify(eps, null, 2)};
 export default function () {
   for (const ep of endpoints) {
     const url = BASE + ep.path;
-    const hasBody = ep.method === 'POST' || ep.method === 'PUT' || ep.method === 'PATCH';
     const params = { headers: { 'Content-Type': 'application/json' }, tags: { name: ep.method + ' ' + ep.path } };
-    const res = http.request(ep.method, url, hasBody ? '{}' : null, params);
+    const res = http.request(ep.method, url, ep.body, params);
     check(res, { 'status < 500': (r) => r.status < 500 });
   }
   sleep(1);
 }
-`;
+` };
 }
 
 async function runK6() {
@@ -2795,12 +2839,14 @@ async function runK6() {
   const files = resolveSourceFiles({ verbose: false });
   const seen = new Set();
   const endpoints = [];
+  const dtoRegistry = {};
   let scanned = 0;
   for (const rel of files) {
     const abs = path.join(CONFIG.srcDir, rel);
     if (!fs.existsSync(abs)) continue;
     scanned++;
     const text = fs.readFileSync(abs, 'utf-8');
+    Object.assign(dtoRegistry, extractDtos(text)); // DTO 샘플 레지스트리 누적
     for (const ep of extractEndpoints(text, path.extname(abs))) {
       const key = `${ep.method} ${ep.path}`;
       if (seen.has(key)) continue;
@@ -2818,12 +2864,14 @@ async function runK6() {
   const outDir = path.resolve(CONFIG.outDir);
   ensureDir(outDir);
   const outFile = path.join(outDir, 'loadtest.k6.js');
-  fs.writeFileSync(outFile, generateK6Script(endpoints, baseUrl, CONFIG.name), 'utf-8');
+  const { script, bodyHits } = generateK6Script(endpoints, baseUrl, CONFIG.name, dtoRegistry);
+  fs.writeFileSync(outFile, script, 'utf-8');
 
   console.log('=============================================');
   console.log(' 🎉 k6 부하테스트 생성 완료!');
   console.log('=============================================');
   console.log(` 🎯 엔드포인트:       ${endpoints.length}개`);
+  console.log(` 📦 DTO 자동 바디:    ${bodyHits}개 (DTO ${Object.keys(dtoRegistry).length}종 인식)`);
   for (const ep of endpoints.slice(0, 12)) console.log(`    ${ep.method.padEnd(6)} ${ep.path}`);
   if (endpoints.length > 12) console.log(`    ... 외 ${endpoints.length - 12}개`);
   console.log(` 📄 스크립트:         ${outFile}`);
