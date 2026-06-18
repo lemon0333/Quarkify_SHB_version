@@ -225,6 +225,30 @@ test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async
   });
 });
 
+test('--perf: ledger 시계열 + hotpath 집계', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const srcDir = path.join(tmp, 'src');
+    const outDir = path.join(tmp, 'out');
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, 'k.cu'),
+      '__global__ void gemm(float* a) { int i = 0; }\n__global__ void softmax(float* x) { int j = 0; }\n', 'utf8');
+    const cfg = path.join(tmp, 'cfg.mjs');
+    const mk = (gemmDur) => writeFile(cfg, `export default { name:'perf', srcDir:${JSON.stringify(srcDir)}, outDir:${JSON.stringify(outDir)}, sourceFiles:['k.cu'], perfData:{ gemm:{duration_ms:${gemmDur},registers:64,dram_pct:72}, softmax:{duration_ms:20,registers:32,dram_pct:40} }, guessRole:()=>'general' };\n`, 'utf8');
+
+    await mk(80); assert.equal(runCli([cfg]).status, 0, '1차');
+    await mk(60); assert.equal(runCli([cfg]).status, 0, '2차');
+
+    const ledger = readFileSync(path.join(outDir, '_ledger', 'ledger.jsonl'), 'utf8').split('\n').filter(Boolean);
+    assert.equal(ledger.length, 2, 'ledger 2 run 누적(시계열)');
+
+    const perf = runCli(['--perf', outDir]);
+    assert.equal(perf.status, 0, perf.stderr || perf.stdout);
+    const report = JSON.parse(readFileSync(path.join(outDir, 'perf_report.json'), 'utf8'));
+    assert.equal(report.hotpath[0].name, 'gemm', 'hotpath 1위 = gemm(80→60, 더 큰 metric)');
+    assert.ok(/25\.0%/.test(perf.stdout), 'run 간 속도변화(↓25%) 출력');
+  });
+});
+
 test('--dead: 호출자 없는 심볼을 데드코드 후보로', async () => {
   await withTempWorkspace(async (tmp) => {
     // Greet 는 아무도 호출 안 함(데드 후보), helper 는 Greet 가 호출함(데드 아님)

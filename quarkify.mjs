@@ -54,6 +54,8 @@ const DIFF_MODE = isMainThread && process.argv[2] === '--diff';
 const SOLVE_MODE = isMainThread && process.argv[2] === '--solve';
 // 데드코드 감지: 콜그래프에서 들어오는 엣지(호출자)가 없는 심볼 = 끊긴 선 = 데드코드 후보.
 const DEAD_MODE = isMainThread && process.argv[2] === '--dead';
+// perf 집계/조인/시계열: grep 으로 못 하는 hotpath 순위·죽은 커널·레지스터·커밋별 속도변화.
+const PERF_MODE = isMainThread && process.argv[2] === '--perf';
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -64,7 +66,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE && !DEAD_MODE) {
+if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE && !DEAD_MODE && !PERF_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -952,6 +954,7 @@ class QuarkFolderEngine {
     this.byOpcodeSites = {};
     this.perfEntries = 0;
     this.symbols = []; // {name,kind,role,file,quark,startLine,endLine,signature} — quark_meta.json + 콜그래프 토대
+    this.perfRecords = []; // {name,quark,perf} — ledger(시계열) + --perf 집계/조인 토대
   }
 
   init() {
@@ -1050,6 +1053,7 @@ class QuarkFolderEngine {
 
   // ─── Zig / CUDA C++ (.cu/.cuh) ───
   processCStyle(text, lines, ext, fileQuarkPath, relPath, lineOffset = 0) {
+    const PERF_DATA = CONFIG.perfData || {};
     let cur = null;
     let depth = 0;
     let openedOnce = false;
@@ -1147,10 +1151,32 @@ class QuarkFolderEngine {
           emitStmtList(stmts, symQuarkPath);
         }
       } else {
-        this.quarkifyBodyFlat(body, symQuarkPath);
+        // 시그니처 줄(예: `func Name(...) {`)을 제외하고 본문만 분해 — 안 그러면
+        // 선언부의 `Name(` 가 자기-호출(call__Name)로 잡혀 콜그래프에 가짜 self 엣지가 생긴다.
+        const open = body.indexOf('{');
+        const flatBody = open >= 0 ? body.substring(open + 1) : body;
+        this.quarkifyBodyFlat(flatBody, symQuarkPath);
       }
 
-      this.registerMirror(cur.kind, cur.role, relPath, path.relative(this.quarkDir, symQuarkPath));
+      // perf 임베드 (CUDA 커널/C++/Zig 등) — Metal/PTX 와 동일하게 측정 데이터를 폴더로 + 레코드로
+      let perfBandTag = null;
+      if (PERF_DATA[cur.name]) {
+        const perf = PERF_DATA[cur.name];
+        const perfDir = path.join(symQuarkPath, '_perf__measured');
+        mkdirSync(perfDir);
+        for (const [k, val] of Object.entries(perf)) {
+          const v = typeof val === 'number' ? String(val).replace('.', '_') : String(val);
+          mkdirSync(path.join(perfDir, `${safeName(k)}__${safeName(v)}`));
+        }
+        if (typeof perf.dram_pct === 'number') {
+          perfBandTag = perfBand(perf.dram_pct);
+          mkdirSync(path.join(perfDir, `dram_band__${perfBandTag}`));
+        }
+        this.perfEntries++;
+        this.perfRecords.push({ name: cur.name, quark: path.relative(this.quarkDir, symQuarkPath), perf });
+      }
+
+      this.registerMirror(cur.kind, cur.role, relPath, path.relative(this.quarkDir, symQuarkPath), perfBandTag);
       // 심볼 메타데이터 기록 (jump-to-source 그라운딩 + 콜그래프 토대)
       const sig = (body.split('\n').find((l) => l.trim()) || '').trim().slice(0, 200);
       this.symbols.push({
@@ -1382,6 +1408,8 @@ class QuarkFolderEngine {
           children.push(`call__${callName}`);
         }
       }
+      // CUDA 커널 런치: kernel<<<grid,block>>>(args) → call__kernel (콜그래프 조인용)
+      for (const m of stmt.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<<</g)) children.push(`call__${m[1]}`);
       const varMatches = stmt.matchAll(/\b(?:const|var|auto)\s+([a-zA-Z0-9_]+)\b/g);
       for (const m of varMatches) children.push(`var__${m[1]}`);
       if (stmt.includes('==')) children.push('binop__equals');
@@ -1583,6 +1611,7 @@ class QuarkFolderEngine {
           perfBandTag = band;
         }
         this.perfEntries++;
+        this.perfRecords.push({ name: entryName, quark: path.relative(this.quarkDir, symQuarkPath), perf });
       }
 
       this.registerMirror(kind, role, relPath, path.relative(this.quarkDir, symQuarkPath), perfBandTag);
@@ -1804,6 +1833,7 @@ class QuarkFolderEngine {
           perfBandTag = band;
         }
         this.perfEntries++;
+        this.perfRecords.push({ name: entryName, quark: path.relative(this.quarkDir, symQuarkPath), perf });
       }
       this.registerMirror('ptx_entry', role, relPath, path.relative(this.quarkDir, symQuarkPath), perfBandTag);
       i = k + 1;
@@ -1845,7 +1875,34 @@ class QuarkFolderEngine {
       this.byOpcodeSites[op].push(...sites);
     }
     if (r.symbols) this.symbols.push(...r.symbols);
+    if (r.perfRecords) this.perfRecords.push(...r.perfRecords);
     this.perfEntries += r.perfEntries || 0;
+  }
+
+  // 이뮤터블 append-only 시계열: 매 실행 스냅샷을 _ledger/ledger.jsonl 에 한 줄 추가.
+  // (init 에서 _ledger 는 보존되므로 실행 간 누적된다 → 커밋별 속도 변화 추적.)
+  writeLedger(meta) {
+    if (!this.perfRecords.length) return null;
+    const ledgerDir = path.join(this.outputDir, '_ledger');
+    mkdirSync(ledgerDir);
+    const file = path.join(ledgerDir, 'ledger.jsonl');
+    let prevRuns = 0;
+    if (fs.existsSync(file)) {
+      prevRuns = fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).length;
+    }
+    const durOf = (p) => (typeof p.duration_ms === 'number' ? p.duration_ms
+      : typeof p.time_pct === 'number' ? p.time_pct
+      : typeof p.sm_pct === 'number' ? p.sm_pct : 0);
+    const totalDuration = this.perfRecords.reduce((s, r) => s + durOf(r.perf), 0);
+    const entry = {
+      run: prevRuns + 1,
+      ts: meta && meta.ts ? meta.ts : null,
+      label: meta && meta.label ? meta.label : null,
+      totalDuration,
+      records: this.perfRecords.map((r) => ({ name: r.name, quark: r.quark, perf: r.perf })),
+    };
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf-8');
+    return entry;
   }
 
   // 심볼 메타데이터를 단일 JSON 으로 출력 (file:line 그라운딩 → AI 할루시네이션 억제)
@@ -2567,6 +2624,8 @@ async function main() {
   const callEdges = engine.buildCallGraph();
   console.log('📇 심볼 메타데이터(quark_meta.json)...');
   engine.writeSymbolMeta();
+  const ledgerEntry = engine.writeLedger({ ts: new Date().toISOString(), label: CONFIG.name });
+  if (ledgerEntry) console.log(`📒 ledger 스냅샷 #${ledgerEntry.run} 기록 (perf ${ledgerEntry.records.length}건)`);
 
   // 시각화 뷰어 및 AI 가이드 자동 생성 (Automatically generate visualization viewer and AI guide)
   engine.writeHtmlViewer();
@@ -2652,6 +2711,7 @@ async function runWorker() {
     byOpcodeSites: engine.byOpcodeSites,
     perfEntries: engine.perfEntries,
     symbols: engine.symbols,
+    perfRecords: engine.perfRecords,
   });
 }
 
@@ -3419,12 +3479,92 @@ async function runDead() {
   console.log('=============================================\n');
 }
 
+// ─── perf 집계/조인/시계열 (--perf): grep 으로 못 만드는 것 ───
+// hotpath 시간점유 순위 · 죽은 커널 · 레지스터 압박 · 커밋(run)별 속도 변화.
+// 데이터 출처: _ledger/ledger.jsonl (forward 실행마다 append). 조인은 콜그래프(resolves_to)와.
+const perfMetric = (p) => (typeof p.duration_ms === 'number' ? p.duration_ms
+  : typeof p.time_pct === 'number' ? p.time_pct
+  : typeof p.sm_pct === 'number' ? p.sm_pct : 0);
+const perfRegisters = (p) => (typeof p.registers === 'number' ? p.registers
+  : typeof p.reg === 'number' ? p.reg : typeof p.regs === 'number' ? p.regs : null);
+
+async function runPerf() {
+  const target = process.argv[3];
+  if (!target) { console.error('사용법: node quarkify.mjs --perf <outDir>'); process.exit(1); }
+  const resolved = path.resolve(target);
+  const ledgerFile = path.join(resolved, '_ledger', 'ledger.jsonl');
+  if (!fs.existsSync(ledgerFile)) {
+    console.error(`❌ perf 데이터(_ledger)가 없습니다. config.perfData 를 채우고 quarkify 하세요: ${ledgerFile}`);
+    process.exit(1);
+  }
+  const runs = fs.readFileSync(ledgerFile, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const latest = runs[runs.length - 1];
+  const prev = runs.length >= 2 ? runs[runs.length - 2] : null;
+  const quarkDir = path.join(resolved, 'quark');
+  const callerIdx = fs.existsSync(quarkDir) ? buildCallerIndex(quarkDir) : {};
+
+  const recs = latest.records.slice();
+  const total = recs.reduce((s, r) => s + perfMetric(r.perf), 0) || 1;
+  const callersOf = (quark) => { const t = safeName(quark).substring(0, 90); const s = callerIdx[t]; return s ? [...s] : []; };
+
+  // 1) HOTPATH 순위 (집계 + 시간점유 %) — grep 불가
+  const hot = recs.map((r) => ({ ...r, m: perfMetric(r.perf), callers: callersOf(r.quark) }))
+    .sort((a, b) => b.m - a.m);
+
+  console.log('=============================================');
+  console.log(` 📊 perf 리포트 (run #${latest.run}${latest.ts ? ' · ' + latest.ts : ''})`);
+  console.log('=============================================');
+  console.log(` perf 엔트리 ${recs.length} · 총 metric ${total.toFixed(1)}`);
+  console.log('\n 🔥 HOTPATH (시간점유 1위 → )');
+  for (const h of hot.slice(0, 12)) {
+    const share = (h.m / total * 100).toFixed(1);
+    console.log(`   ${share.padStart(5)}%  ${h.name}  (호출자 ${h.callers.length})`);
+  }
+
+  // 2) 죽은 커널 (JOIN: perf × 콜그래프) — 측정됐지만 호출자 0 이거나 metric 0
+  const deadKernels = hot.filter((h) => h.callers.length === 0 || h.m === 0);
+  console.log(`\n 🪦 죽은 커널 (호출자 0 또는 시간 0): ${deadKernels.length}`);
+  for (const d of deadKernels.slice(0, 10)) console.log(`   ✂️ ${d.name} (metric ${d.m})`);
+
+  // 3) 레지스터 압박 (ptxas 실측) — 있으면
+  const withReg = recs.map((r) => ({ name: r.name, reg: perfRegisters(r.perf) })).filter((r) => r.reg != null)
+    .sort((a, b) => b.reg - a.reg);
+  if (withReg.length) {
+    console.log('\n 🧮 레지스터 압박 상위:');
+    for (const r of withReg.slice(0, 8)) console.log(`   ${String(r.reg).padStart(4)} regs  ${r.name}`);
+  }
+
+  // 4) 시계열 (run 간 속도 변화) — JOIN by name, latest vs prev
+  if (prev) {
+    const prevMap = {}; for (const r of prev.records) prevMap[r.name] = perfMetric(r.perf);
+    const deltas = recs.map((r) => ({ name: r.name, now: perfMetric(r.perf), was: prevMap[r.name] }))
+      .filter((d) => typeof d.was === 'number' && d.was !== d.now)
+      .map((d) => ({ ...d, deltaPct: d.was ? ((d.now - d.was) / d.was * 100) : 0 }))
+      .sort((a, b) => a.deltaPct - b.deltaPct);
+    console.log(`\n ⏱  run #${prev.run}→#${latest.run} 변화 (음수=빨라짐):`);
+    for (const d of deltas.slice(0, 10)) {
+      const arrow = d.deltaPct < 0 ? '↓' : '↑';
+      console.log(`   ${arrow}${Math.abs(d.deltaPct).toFixed(1).padStart(5)}%  ${d.name}  (${d.was}→${d.now})`);
+    }
+    if (!deltas.length) console.log('   (변화 없음)');
+  } else {
+    console.log('\n ⏱  시계열: 스냅샷 1개뿐 — 다음 실행부터 run 간 비교 제공');
+  }
+
+  fs.writeFileSync(path.join(resolved, 'perf_report.json'),
+    JSON.stringify({ run: latest.run, hotpath: hot, deadKernels, registers: withReg }), 'utf-8');
+  console.log(`\n 📄 ${path.join(resolved, 'perf_report.json')}`);
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
+} else if (PERF_MODE) {
+  runPerf().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (DEAD_MODE) {
   runDead().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (SOLVE_MODE) {
