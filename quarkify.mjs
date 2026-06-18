@@ -37,6 +37,7 @@ import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import crypto from 'crypto';
 import { Worker, isMainThread, workerData, parentPort } from 'worker_threads';
 
 // ─── CLI / 컨피그 로드 (Load CLI / Config) ───
@@ -965,6 +966,32 @@ class QuarkFolderEngine {
     mkdirSync(this.quarkDir);
     mkdirSync(this.mirrorDir);
     mkdirSync(this.axonDir);
+  }
+
+  // 증분 빌드용 init: quark/ 는 보존(변경 파일만 갱신), 파생물(_mirror/_axon)만 재생성.
+  initIncremental() {
+    for (const d of [this.mirrorDir, this.axonDir]) {
+      if (fs.existsSync(d)) fs.rmSync(d, { recursive: true });
+    }
+    mkdirSync(this.outputDir);
+    fs.writeFileSync(path.join(this.outputDir, OUTPUT_MARKER), 'quarkify output directory\n', 'utf-8');
+    mkdirSync(this.quarkDir);
+    mkdirSync(this.mirrorDir);
+    mkdirSync(this.axonDir);
+  }
+
+  // 변경되지 않은 파일의 캐시된 심볼을 복원 (재파싱 없이 미러/메타/콜그래프 토대 재구성).
+  loadCachedSymbols(symbols) {
+    for (const s of symbols || []) {
+      this.symbols.push(s);
+      this.registerMirror(s.kind, s.role, s.file, s.quark);
+    }
+  }
+
+  // 한 소스 파일의 quark 폴더 삭제 (변경/삭제 파일 정리용)
+  removeFileQuark(relPath) {
+    const dir = path.join(this.quarkDir, `file__${safeName(relPath)}`);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
   }
 
   processFile(absPath, relPath) {
@@ -2432,14 +2459,53 @@ async function main() {
   }
 
   const engine = new QuarkFolderEngine(CONFIG.outDir);
-  engine.init();
 
-  // 존재하는 파일만 추려서 작업 목록 구성 (Build the work list of existing files only)
-  const jobs = [];
+  // 증분 빌드 여부 (opt-in): CONFIG.incremental 또는 env QUARKIFY_INCREMENTAL
+  const incrementalWanted = CONFIG.incremental === true || ['1', 'true', 'yes'].includes(String(process.env.QUARKIFY_INCREMENTAL || '').toLowerCase());
+  const cachePath = path.join(CONFIG.outDir, '.quarkify-cache.json');
+  let prevCache = null;
+  if (incrementalWanted && fs.existsSync(cachePath) && fs.existsSync(engine.quarkDir)) {
+    try { prevCache = JSON.parse(fs.readFileSync(cachePath, 'utf-8')); } catch { prevCache = null; }
+  }
+  const incremental = incrementalWanted && prevCache && prevCache.version === 1;
+
+  // 존재하는 파일만 추려서 (abs, rel, hash) 목록 구성
+  const present = [];
   for (const rel of resolvedFiles) {
     const abs = path.join(CONFIG.srcDir, rel);
     if (!fs.existsSync(abs)) { console.log(`[-] 건너뜀: ${rel}`); continue; }
-    jobs.push({ abs, rel });
+    const hash = crypto.createHash('sha1').update(fs.readFileSync(abs)).digest('hex');
+    present.push({ abs, rel, hash });
+  }
+
+  let jobs;
+  if (incremental) {
+    engine.initIncremental();
+    const prevFiles = prevCache.files || {};
+    const presentRels = new Set(present.map((p) => p.rel));
+    // 삭제된 파일: quark 폴더 제거
+    let deleted = 0;
+    for (const rel of Object.keys(prevFiles)) {
+      if (!presentRels.has(rel)) { engine.removeFileQuark(rel); deleted++; }
+    }
+    // 변경 없음: 캐시 심볼 복원 / 변경·신규: 작업 목록에
+    jobs = [];
+    let unchanged = 0;
+    for (const p of present) {
+      const cached = prevFiles[p.rel];
+      const quarkExists = fs.existsSync(path.join(engine.quarkDir, `file__${safeName(p.rel)}`));
+      if (cached && cached.hash === p.hash && quarkExists) {
+        engine.loadCachedSymbols(cached.symbols);
+        unchanged++;
+      } else {
+        engine.removeFileQuark(p.rel); // 변경분: 기존 폴더 정리 후 재생성
+        jobs.push({ abs: p.abs, rel: p.rel });
+      }
+    }
+    console.log(`♻️  증분 빌드: 변경/신규 ${jobs.length} · 변경없음 ${unchanged} · 삭제 ${deleted}`);
+  } else {
+    engine.init();
+    jobs = present.map((p) => ({ abs: p.abs, rel: p.rel }));
   }
 
   const workerCount = resolveWorkerCount(jobs.length);
@@ -2472,6 +2538,13 @@ async function main() {
   engine.writeHtmlViewer();
   engine.writeHtmlViewer3D();
   engine.writeAiContextGuide();
+
+  // 증분 빌드용 캐시 저장 (파일 해시 + 파일별 심볼). 다음 실행에서 변경분만 재처리.
+  const symsByFile = {};
+  for (const sym of engine.symbols) (symsByFile[sym.file] || (symsByFile[sym.file] = [])).push(sym);
+  const cacheOut = { version: 1, files: {} };
+  for (const p of present) cacheOut.files[p.rel] = { hash: p.hash, symbols: symsByFile[p.rel] || [] };
+  fs.writeFileSync(cachePath, JSON.stringify(cacheOut), 'utf-8');
 
   const s = engine.getStats();
   console.log('\n=============================================');

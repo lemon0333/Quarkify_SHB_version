@@ -180,6 +180,33 @@ class C(private val s: S) {
   });
 });
 
+test('증분 빌드: 무변경 재실행은 동일, 변경분만 갱신', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const srcDir = path.join(tmp, 'src');
+    const outDir = path.join(tmp, 'out');
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(path.join(srcDir, 'A.kt'), 'class A {\n  fun a() {}\n}\n', 'utf8');
+    await writeFile(path.join(srcDir, 'B.kt'), 'class B {\n  fun b() {}\n}\n', 'utf8');
+    const configPath = path.join(tmp, 'config.mjs');
+    await writeFile(configPath, `export default { name:'inc', srcDir:${JSON.stringify(srcDir)}, outDir:${JSON.stringify(outDir)}, sourceFiles:['*.kt'], perfData:{}, incremental:true, guessRole:()=>'general' };\n`, 'utf8');
+
+    assert.equal(runCli([configPath]).status, 0, '1차 빌드');
+    const after1 = dirsOf(path.join(outDir, 'quark'));
+    assert.ok(existsSync(path.join(tmp, 'out', '.quarkify-cache.json')), '캐시 생성');
+
+    const r2 = runCli([configPath]);
+    assert.equal(r2.status, 0, '2차(무변경) 빌드');
+    assert.ok(/변경없음 2/.test(r2.stdout), '무변경 2개 인식');
+    assert.deepEqual(dirsOf(path.join(outDir, 'quark')), after1, '무변경 시 구조 동일');
+
+    await writeFile(path.join(srcDir, 'B.kt'), 'class B {\n  fun b() {}\n  fun bb() {}\n}\n', 'utf8');
+    const r3 = runCli([configPath]);
+    assert.equal(r3.status, 0, '3차(변경) 빌드');
+    assert.ok(/변경\/신규 1/.test(r3.stdout), '변경 1개만 재처리');
+    assert.ok(existsSync(path.join(outDir, 'quark', 'file__B.kt', 'class__B', 'fn__bb')), '변경분 fn__bb 반영');
+  });
+});
+
 test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async () => {
   await withTempWorkspace(async (tmp) => {
     const kt = `class AuthService {
