@@ -1013,9 +1013,60 @@ class QuarkFolderEngine {
     if (ext === '.metal') { this.processMetal(text, fileQuarkPath, relPath); return; }
     if (ext === '.m' || ext === '.mm') { this.processObjC(text, fileQuarkPath, relPath); return; }
     if (ext === '.py') { this.processPython(text, fileQuarkPath, relPath); return; }
+    if (ext === '.html' || ext === '.htm') { this.processHtml(text, fileQuarkPath, relPath); return; }
 
     // Zig / .cu / .cuh — symbol detection + recursive fn body for Zig
     this.processCStyle(text, lines, ext, fileQuarkPath, relPath);
+  }
+
+  // ─── HTML 파서 ───
+  // 의미있는 블록/시맨틱 요소를 폴더 토폴로지로 분해. id/class 를 폴더명에 담아
+  // "hero 섹션만 고쳐" 같은 요청을 --solve 로 정확히 타겟할 수 있게 한다(섹션 단위 그라운딩 편집).
+  processHtml(text, fileQuarkPath, relPath) {
+    const VOID = new Set(['meta', 'link', 'br', 'hr', 'img', 'input', 'source', 'area', 'base', 'col', 'embed', 'track', 'wbr']);
+    // 폴더로 만들 가치가 있는 요소 (인라인 span/b/i 등은 제외)
+    const INTEREST = new Set(['html', 'head', 'body', 'header', 'nav', 'main', 'section', 'article', 'aside', 'footer',
+      'form', 'fieldset', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'button', 'a', 'label', 'ul', 'ol', 'li', 'table',
+      'figure', 'dialog', 'select', 'textarea', 'input', 'img', 'style', 'script', 'div']);
+    const lineAt = (pos) => text.slice(0, pos).split('\n').length;
+    const tagRe = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>])*?)(\/?)>/g;
+    const stack = [{ tag: '#root', path: fileQuarkPath }];
+    let m;
+    const finalize = (node, endLine) => {
+      const rel = path.relative(this.quarkDir, node.path);
+      this.symbols.push({
+        name: node.name, kind: node.kind, role: 'ui', file: relPath, quark: rel,
+        startLine: node.startLine, endLine, signature: node.sig,
+      });
+      this.registerMirror(node.kind, 'ui', relPath, rel);
+    };
+    while ((m = tagRe.exec(text))) {
+      const closing = m[1] === '/';
+      const tag = m[2].toLowerCase();
+      const attrs = m[3] || '';
+      const selfClose = m[4] === '/' || VOID.has(tag);
+      if (closing) {
+        for (let i = stack.length - 1; i > 0; i--) {
+          if (stack[i].tag === tag) { finalize(stack[i], lineAt(tagRe.lastIndex)); stack.length = i; break; }
+        }
+        continue;
+      }
+      if (!INTEREST.has(tag)) continue;
+      const idM = attrs.match(/\bid\s*=\s*["']([^"']+)/);
+      const clM = attrs.match(/\bclass\s*=\s*["']([^"']+)/);
+      const name = idM ? idM[1] : (clM ? clM[1].split(/\s+/)[0] : tag);
+      const kind = /^h[1-6]$/.test(tag) ? 'heading' : (tag === 'section' || tag === 'article' || tag === 'form') ? 'section' : 'element';
+      const parent = stack[stack.length - 1].path;
+      const full = path.join(parent, `${tag}__${safeName(name)}`);
+      mkdirSync(full);
+      if (idM) mkdirSync(path.join(full, `id__${safeName(idM[1])}`));
+      if (clM) mkdirSync(path.join(full, `class__${safeName(clM[1].split(/\s+/)[0])}`));
+      const node = { tag, path: full, name, kind, startLine: lineAt(m.index), sig: m[0].slice(0, 120) };
+      if (selfClose) finalize(node, node.startLine);
+      else stack.push(node);
+    }
+    // 닫히지 않은(또는 끝까지 연) 요소 정리
+    for (let i = stack.length - 1; i > 0; i--) finalize(stack[i], lineAt(text.length));
   }
 
   processPython(text, fileQuarkPath, relPath) {

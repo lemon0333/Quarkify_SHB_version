@@ -225,6 +225,25 @@ test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async
   });
 });
 
+test('HTML: 섹션/시맨틱 요소를 폴더 토폴로지로 분해 (--solve 그라운딩용)', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const html = `<!DOCTYPE html><html><body>
+  <header id="top"><nav class="menu"><a>홈</a></nav></header>
+  <section id="hero"><h1>큰 제목</h1><button class="cta">신청</button></section>
+  <section id="contact"><h2>문의</h2><form><input /></form></section>
+</body></html>`;
+    const { outDir } = await quarkifyProject(tmp, { 'index.html': html }, ['index.html']);
+    const base = path.join(outDir, 'quark', 'file__index.html');
+    assert.ok(existsSync(path.join(base, 'body', 'section__hero')), 'section__hero 폴더');
+    assert.ok(existsSync(path.join(base, 'body', 'section__contact')), 'section__contact 폴더');
+    assert.ok(existsSync(path.join(base, 'body', 'section__hero', 'id__hero')), 'id__hero');
+    const meta = JSON.parse(readFileSync(path.join(outDir, 'quark_meta.json'), 'utf8'));
+    const hero = meta.symbols.find((s) => s.name === 'hero' && s.kind === 'section');
+    assert.ok(hero && hero.startLine > 0 && hero.endLine >= hero.startLine, 'hero 섹션이 line 범위와 함께 심볼로 잡힘');
+    assert.ok(meta.symbols.some((s) => s.kind === 'heading'), '헤딩 심볼 존재');
+  });
+});
+
 test('TS 객체 const 는 내부 세미콜론에서 끊기지 않고 전체 범위를 잡는다', async () => {
   await withTempWorkspace(async (tmp) => {
     const ts = `export const logger = {
