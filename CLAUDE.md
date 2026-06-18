@@ -17,15 +17,15 @@ Quarkify는 토대/엔진이다. 견고함·지능은 여기 들어가야 모든
 - 출력은 결정적(병렬=순차 동일).
 
 ## 구현된 기능 (요약)
-파서: TS/JS·Python·Kotlin·Java·Go·Rust·Swift·C#·Zig·CUDA·C/C++·Metal·PTX.
-모드: 기본 quarkify, `--collapse`/`--expand`, `--k6`, `--doc`/`--doc-join`, `--stats`, `--diff`, `--solve`.
-부가: 콜그래프(`resolves_to__`), `quark_meta.json`(file:line), 증분 빌드, 2D/3D 뷰어, 워커 병렬화.
+파서: TS/JS·Python·Kotlin·Java·Go·Rust·Swift·C#·Zig·CUDA·C/C++·Metal·PTX. 언어 `auto` 자동감지 + 무매칭 폴백.
+모드: 기본 quarkify, `--collapse`/`--expand`, `--k6`, `--doc`/`--doc-join`, `--stats`, `--diff`, `--solve`, `--dead`, `--perf`, `--scan`.
+부가: 콜그래프(`resolves_to__`), `quark_meta.json`(file:line), 증분 빌드, 2D/3D/**4D**(시간축=ledger) 뷰어, 워커 병렬화.
+- **데드코드** `--dead`: 호출자 없는 심볼(어노테이션/진입점 제외).
+- **perf** `--perf` + `_ledger`(append-only 시계열): hotpath 시간점유 순위, perf×콜그래프 조인, 죽은 커널, ptxas 레지스터, run 간 속도변화.
+- **보안** `--scan`: trivy fs(취약점/시크릿/미스컨피그) → 파일(토폴로지)별 조인 리포트.
 
-## 로드맵 (브레인덤프 기반)
-- **데드코드 감지**: 콜그래프에서 들어오는 엣지 없고 진입점도 아닌 심볼 = 끊긴 선 = 데드코드.
-- **perf 집계/시계열/조인**: hotpath 총 시간점유 1위 커널, 커밋별 속도 향상(ledger=시계열), 죽은 커널, ptxas 레지스터 실측.
-- **보안 스캔 통합**(Trivy/Chainguard)을 폴더 토폴로지에 매핑.
-- **4D 시각화**(시간축=ledger), 폴더 간 점/선 그래프.
+## 로드맵 (다음)
+- ledger 기반 perf 회귀 알림/CI 게이트, 보안 발견을 quark 트리에 폴더로 폴딩, 콜그래프 시각화 강화.
 
 ## 커밋 규칙
 이 repo 커밋엔 Claude/Co-Authored-By 어트리뷰션을 넣지 않는다. (remote `shb` = github.com/lemon0333/Quarkify_SHB_version)
