@@ -225,6 +225,28 @@ test('--solve: 이슈 키워드로 관련 심볼 컨텍스트 팩 생성', async
   });
 });
 
+test('TS 객체 const 는 내부 세미콜론에서 끊기지 않고 전체 범위를 잡는다', async () => {
+  await withTempWorkspace(async (tmp) => {
+    const ts = `export const logger = {
+  info: (m) => {
+    if (true) {
+      return;
+    }
+    console.log(m);
+  },
+  fatal: (m) => {
+    console.log(m);
+  },
+};
+`;
+    const { outDir } = await quarkifyProject(tmp, { 'm.ts': ts }, ['m.ts']);
+    const meta = JSON.parse(readFileSync(path.join(outDir, 'quark_meta.json'), 'utf8'));
+    const logger = meta.symbols.find((s) => s.name === 'logger' && s.kind === 'var');
+    assert.ok(logger, 'logger 객체 const 가 var 심볼로 잡힘');
+    assert.ok(logger.endLine >= 11, `endLine 이 객체 끝(>=11)까지 — 내부 return; 에서 안 끊김 (got ${logger.endLine})`);
+  });
+});
+
 test('--perf: ledger 시계열 + hotpath 집계', async () => {
   await withTempWorkspace(async (tmp) => {
     const srcDir = path.join(tmp, 'src');

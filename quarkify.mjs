@@ -1284,6 +1284,9 @@ class QuarkFolderEngine {
             name = m[1]; kind = 'fn'; role = guessRole(name);
           } else if ((m = line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?function\b/))) {
             name = m[1]; kind = 'fn'; role = guessRole(name);
+          } else if ((m = line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=/))) {
+            // 모듈레벨 const/var (객체/값) — 예: `export const logger = {...}`. 화살표/함수는 위에서 이미 fn 으로 처리됨.
+            name = m[1]; kind = 'var'; role = 'state';
           }
         } else if (isKt) {
           const trimmed = line.trim();
@@ -1361,7 +1364,7 @@ class QuarkFolderEngine {
           } else {
             depth = openers - closers;
             openedOnce = openers > 0;
-            if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
+            if (cur.kind === 'var' && depth <= 0 && line.includes(';')) finishSymbol(i + 1);
             else if (openedOnce && depth <= 0) finishSymbol(i + 1);
           }
         }
@@ -1370,7 +1373,7 @@ class QuarkFolderEngine {
       } else {
         depth += openers - closers;
         if (openers > 0) openedOnce = true;
-        if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
+        if (cur.kind === 'var' && depth <= 0 && line.includes(';')) finishSymbol(i + 1);
         else if (openedOnce && depth <= 0) finishSymbol(i + 1);
       }
     }
