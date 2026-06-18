@@ -246,6 +246,7 @@ test('--perf: ledger 시계열 + hotpath 집계', async () => {
     const report = JSON.parse(readFileSync(path.join(outDir, 'perf_report.json'), 'utf8'));
     assert.equal(report.hotpath[0].name, 'gemm', 'hotpath 1위 = gemm(80→60, 더 큰 metric)');
     assert.ok(/25\.0%/.test(perf.stdout), 'run 간 속도변화(↓25%) 출력');
+    assert.ok(existsSync(path.join(outDir, 'index_4d.html')), '4D 뷰어(시간축) 생성');
   });
 });
 

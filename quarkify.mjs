@@ -56,6 +56,8 @@ const SOLVE_MODE = isMainThread && process.argv[2] === '--solve';
 const DEAD_MODE = isMainThread && process.argv[2] === '--dead';
 // perf 집계/조인/시계열: grep 으로 못 하는 hotpath 순위·죽은 커널·레지스터·커밋별 속도변화.
 const PERF_MODE = isMainThread && process.argv[2] === '--perf';
+// 보안 스캔: trivy fs(취약점/시크릿/미스컨피그) → 파일(토폴로지)별로 조인한 리포트.
+const SCAN_MODE = isMainThread && process.argv[2] === '--scan';
 // --k6 는 config 가 필요하다 (srcDir/sourceFiles 재사용). config 경로는 argv[3].
 // (--k6 needs a config; its path is argv[3].)
 const K6_MODE = isMainThread && process.argv[2] === '--k6';
@@ -66,7 +68,7 @@ const configPath = isMainThread ? (K6_MODE ? process.argv[3] : process.argv[2]) 
 let CONFIG = {};
 let cfgAbs = null;
 
-if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE && !DEAD_MODE && !PERF_MODE) {
+if (!REVERSE_MODE && !DOC_MODE && !STATS_MODE && !DIFF_MODE && !SOLVE_MODE && !DEAD_MODE && !PERF_MODE && !SCAN_MODE) {
   if (!configPath) {
     console.error('❌ 에러: 설정 파일 경로가 제공되지 않았습니다.');
     console.error('사용법: node quarkify.mjs <configs/config_name.mjs>');
@@ -2319,6 +2321,58 @@ class QuarkFolderEngine {
     console.log(`[+] 3D 토폴로지 뷰어 빌드 완료: ${outPath}`);
   }
 
+  // 4D 뷰어 — 3D 토폴로지 + 시간축(ledger run). 타임 슬라이더로 run 을 스크럽하면
+  // perf 노드가 해당 run 의 metric 으로 히트맵 색·크기로 갱신된다. ledger 가 있을 때만 생성.
+  writeHtmlViewer4D() {
+    const ledgerFile = path.join(this.outputDir, '_ledger', 'ledger.jsonl');
+    if (!fs.existsSync(ledgerFile)) return;
+    const runs = fs.readFileSync(ledgerFile, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    if (!runs.length) return;
+    const graphData = this.collectTopologyGraphData();
+    const metricOf = (p) => (typeof p.duration_ms === 'number' ? p.duration_ms
+      : typeof p.time_pct === 'number' ? p.time_pct : typeof p.sm_pct === 'number' ? p.sm_pct : 0);
+    // run 별 name→metric 맵
+    const perRun = runs.map((r) => {
+      const m = {}; let max = 0;
+      for (const rec of r.records) { const v = metricOf(rec.perf); m[rec.name] = v; if (v > max) max = v; }
+      return { run: r.run, ts: r.ts, label: r.label, metrics: m, max: max || 1 };
+    });
+    const html = `<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><title>Quarkify 4D - ${CONFIG.name}</title>
+<style>
+  body{margin:0;background:#05070d;color:#e2e8f0;font-family:-apple-system,sans-serif;overflow:hidden}
+  #info{position:absolute;top:12px;left:12px;z-index:10;background:rgba(15,23,42,.7);padding:12px 16px;border-radius:12px}
+  #info h1{margin:0 0 4px;font-size:16px;color:#fbbf24}
+  #ctl{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);z-index:10;background:rgba(15,23,42,.8);padding:12px 18px;border-radius:12px;text-align:center}
+  #ctl input{width:340px;vertical-align:middle}
+</style>
+<script src="https://unpkg.com/3d-force-graph"></script></head>
+<body>
+<div id="info"><h1>Quarkify 4D ⚛️⏱</h1><div>${CONFIG.name}</div>
+  <div style="color:#64748b;font-size:11px">시간축 = ledger run · perf 노드가 시간에 따라 히트맵으로 변함</div></div>
+<div id="ctl"><span id="lbl"></span><br><input id="t" type="range" min="0" max="${perRun.length - 1}" value="${perRun.length - 1}" step="1"></div>
+<div id="g"></div>
+<script>
+  const data=${JSON.stringify(graphData)};
+  const RUNS=${JSON.stringify(perRun)};
+  const heat=(f)=>{ // 0..1 → 파랑→빨강
+    const r=Math.round(255*f), b=Math.round(255*(1-f)); return 'rgb('+r+',80,'+b+')';
+  };
+  const G=ForceGraph3D()(document.getElementById('g')).graphData(data).backgroundColor('#05070d')
+    .nodeLabel(n=>n.label).linkColor(()=>'rgba(255,255,255,0.1)').linkWidth(0.4);
+  function apply(i){
+    const R=RUNS[i]; document.getElementById('lbl').textContent='run #'+R.run+(R.ts?' · '+R.ts:'')+'  (perf '+Object.keys(R.metrics).length+')';
+    G.nodeColor(n=>{ const v=R.metrics[n.label]; return v==null?'#334155':heat(v/R.max); })
+     .nodeVal(n=>{ const v=R.metrics[n.label]; return v==null?(n.val||1):2+8*(v/R.max); });
+  }
+  document.getElementById('t').addEventListener('input',e=>apply(+e.target.value));
+  apply(${perRun.length - 1});
+</script></body></html>`;
+    const outPath = path.join(this.outputDir, 'index_4d.html');
+    fs.writeFileSync(outPath, html, 'utf-8');
+    console.log(`[+] 4D 토폴로지 뷰어 빌드 완료: ${outPath} (ledger ${runs.length} run)`);
+  }
+
   writeAiContextGuide() {
     const text = `================================================================================
 🤖 AI 코딩 에이전트(LLM) 전용 위상 지도 네비게이션 가이드 (AI Context Guide)
@@ -2630,6 +2684,7 @@ async function main() {
   // 시각화 뷰어 및 AI 가이드 자동 생성 (Automatically generate visualization viewer and AI guide)
   engine.writeHtmlViewer();
   engine.writeHtmlViewer3D();
+  engine.writeHtmlViewer4D();
   engine.writeAiContextGuide();
 
   // 증분 빌드용 캐시 저장 (파일 해시 + 파일별 심볼). 다음 실행에서 변경분만 재처리.
@@ -3557,12 +3612,68 @@ async function runPerf() {
   console.log('=============================================\n');
 }
 
+// ─── 보안 스캔 (--scan): trivy fs → 파일(토폴로지)별 조인 리포트 ───
+// 오픈소스 스캐너(trivy)의 취약점/시크릿/미스컨피그를 폴더 토폴로지(파일)에 매핑.
+async function runScan() {
+  const target = process.argv[3];
+  if (!target) { console.error('사용법: node quarkify.mjs --scan <srcDir> [outFile.json]'); process.exit(1); }
+  const resolved = path.resolve(target);
+  if (!fs.existsSync(resolved)) { console.error(`❌ 경로 없음: ${resolved}`); process.exit(1); }
+
+  let raw;
+  try {
+    raw = execSync(`trivy fs --scanners vuln,secret,misconfig --format json --quiet ${JSON.stringify(resolved)}`,
+      { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      console.error('❌ trivy 가 설치되어 있지 않습니다. `brew install trivy` 후 다시 시도하세요.');
+    } else {
+      console.error('❌ trivy 실행 실패:', err && err.message ? err.message.split('\n')[0] : err);
+    }
+    process.exit(1);
+  }
+
+  let data; try { data = JSON.parse(raw); } catch { console.error('❌ trivy JSON 파싱 실패'); process.exit(1); }
+  const findings = [];
+  for (const r of data.Results || []) {
+    const file = r.Target || '';
+    for (const v of r.Vulnerabilities || []) findings.push({ kind: 'vuln', file, sev: v.Severity || 'UNKNOWN', id: v.VulnerabilityID, what: `${v.PkgName} ${v.InstalledVersion || ''}`.trim() });
+    for (const s of r.Secrets || []) findings.push({ kind: 'secret', file, sev: s.Severity || 'UNKNOWN', id: s.RuleID, what: s.Title });
+    for (const m of r.Misconfigurations || []) findings.push({ kind: 'misconfig', file, sev: m.Severity || 'UNKNOWN', id: m.ID, what: m.Title });
+  }
+
+  // 집계: 심각도별, 파일(토폴로지)별
+  const bySev = {}; const byFile = {};
+  for (const f of findings) {
+    bySev[f.sev] = (bySev[f.sev] || 0) + 1;
+    (byFile[f.file] = byFile[f.file] || []).push(f);
+  }
+  const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'];
+  const topFiles = Object.entries(byFile).sort((a, b) => b[1].length - a[1].length);
+
+  console.log('=============================================');
+  console.log(' 🛡  보안 스캔 (trivy → 토폴로지 조인)');
+  console.log('=============================================');
+  console.log(` 총 발견 ${findings.length}  |  ${SEV_ORDER.filter((s) => bySev[s]).map((s) => `${s} ${bySev[s]}`).join(' · ') || '없음'}`);
+  console.log('\n 📂 파일별 (토폴로지 조인) 상위:');
+  for (const [file, fs2] of topFiles.slice(0, 12)) {
+    const sevs = SEV_ORDER.filter((s) => fs2.some((x) => x.sev === s)).join(',');
+    console.log(`   ${String(fs2.length).padStart(3)}건 [${sevs}]  ${file}`);
+  }
+  const outFile = process.argv[4] ? path.resolve(process.argv[4]) : path.join(resolved, 'security_report.json');
+  fs.writeFileSync(outFile, JSON.stringify({ total: findings.length, bySev, findings }), 'utf-8');
+  console.log(`\n 📄 ${outFile}`);
+  console.log('=============================================\n');
+}
+
 // ─── 진입점 분기 (Entry-point dispatch) ───
 if (!isMainThread) {
   runWorker().catch((err) => {
     console.error(err && err.message ? err.message : err);
     process.exit(1);
   });
+} else if (SCAN_MODE) {
+  runScan().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (PERF_MODE) {
   runPerf().catch((err) => { console.error(err && err.message ? err.message : err); process.exit(1); });
 } else if (DEAD_MODE) {
