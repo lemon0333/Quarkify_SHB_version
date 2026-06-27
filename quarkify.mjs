@@ -1210,7 +1210,7 @@ class QuarkFolderEngine {
         // 선언부의 `Name(` 가 자기-호출(call__Name)로 잡혀 콜그래프에 가짜 self 엣지가 생긴다.
         const open = body.indexOf('{');
         const flatBody = open >= 0 ? body.substring(open + 1) : body;
-        this.quarkifyBodyFlat(flatBody, symQuarkPath);
+        this.quarkifyBodyFlat(flatBody, symQuarkPath, ext);
       }
 
       // perf 임베드 (CUDA 커널/C++/Zig 등) — Metal/PTX 와 동일하게 측정 데이터를 폴더로 + 레코드로
@@ -1331,7 +1331,7 @@ class QuarkFolderEngine {
           if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*') || trimmed.length === 0 || trimmed.startsWith('import ') || trimmed.startsWith('export *')) {
           } else if ((m = line.match(/^\s*(?:export\s+)?(class|interface)\s+([a-zA-Z0-9_]+)/))) {
             name = m[2]; kind = m[1]; role = 'type';
-          } else if ((m = line.match(/^\s*(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(/))) {
+          } else if ((m = line.match(/^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(/))) {
             name = m[1]; kind = 'fn'; role = guessRole(name);
           } else if ((m = line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>/))) {
             name = m[1]; kind = 'fn'; role = guessRole(name);
@@ -1433,7 +1433,7 @@ class QuarkFolderEngine {
     finishSymbol(lines.length);
   }
 
-  quarkifyBodyFlat(body, parentPath) {
+  quarkifyBodyFlat(body, parentPath, ext) {
     const cleanBody = body.replace(/\/\/.*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
     const statements = cleanBody.split(/(;|\{|\})/);
     let stmtIndex = 0;
@@ -1468,6 +1468,14 @@ class QuarkFolderEngine {
       }
       // CUDA 커널 런치: kernel<<<grid,block>>>(args) → call__kernel (콜그래프 조인용)
       for (const m of stmt.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<<</g)) children.push(`call__${m[1]}`);
+      // JSX 컴포넌트 렌더: <Component .../> → render__Component (콜그래프가 컴포넌트 정의로 연결).
+      // 대문자 시작 태그만(소문자 HTML 태그 제외). 제네릭(Array<Foo>, useState<T>)과 구분하기 위해
+      // '<' 앞이 식별자 문자가 아니고, 컴포넌트명 바로 뒤가 공백/'/'/'>' 인 경우만 잡는다.
+      if (ext === '.tsx' || ext === '.jsx') {
+        for (const m of stmt.matchAll(/(?<![A-Za-z0-9_$])<([A-Z][A-Za-z0-9_]*)(?=[\s/>])/g)) {
+          children.push(`render__${m[1]}`);
+        }
+      }
       const varMatches = stmt.matchAll(/\b(?:const|var|auto)\s+([a-zA-Z0-9_]+)\b/g);
       for (const m of varMatches) children.push(`var__${m[1]}`);
       if (stmt.includes('==')) children.push('binop__equals');
@@ -1984,14 +1992,17 @@ class QuarkFolderEngine {
       if (s.name.includes('__')) add(s.name.split('__').pop(), s.quark); // C++ Class__method
     }
     let edges = 0;
-    const callPrefix = 'call__';
+    // 엣지 사이트 접두사: 일반 호출(call__) + JSX 컴포넌트 렌더(render__).
+    // 둘 다 정의 심볼로 resolves_to__ 연결하되, 폴더명으로 호출/렌더가 구분된다.
+    const edgePrefixes = ['call__', 'render__'];
     const walk = (dir) => {
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
         if (!e.isDirectory()) continue;
-        if (e.name.startsWith(callPrefix)) {
-          const callee = e.name.slice(callPrefix.length);
+        const pref = edgePrefixes.find((p) => e.name.startsWith(p));
+        if (pref) {
+          const callee = e.name.slice(pref.length);
           const defs = defIndex[callee];
           if (defs) {
             for (const d of defs) {
@@ -1999,7 +2010,7 @@ class QuarkFolderEngine {
               edges++;
             }
           }
-          // call__ 은 잎으로 취급, 더 안 내려간다
+          // call__ / render__ 는 잎으로 취급, 더 안 내려간다
         } else {
           walk(path.join(dir, e.name));
         }
@@ -2107,6 +2118,7 @@ class QuarkFolderEngine {
         else if (entry.name.startsWith('annotation__')) { type = 'annotation'; label = '@' + entry.name.replace('annotation__', ''); }
         else if (entry.name.startsWith('stmt_')) { type = 'control_stmt'; }
         else if (entry.name.startsWith('call__')) { type = 'api_call'; label = entry.name.replace('call__', '') + '()'; }
+        else if (entry.name.startsWith('render__')) { type = 'api_call'; label = '<' + entry.name.replace('render__', '') + '/>'; }
         else if (entry.name.startsWith('cond__') || entry.name.startsWith('cond___')) { type = 'condition'; }
         else if (entry.name.startsWith('catch__') || entry.name.startsWith('catch___')) { type = 'catch'; }
 
